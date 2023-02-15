@@ -28,6 +28,7 @@
 #include "yb/master/catalog_entity_info.h"
 #include "yb/master/catalog_manager_if.h"
 #include "yb/master/master_backup.proxy.h"
+#include "yb/master/master_cluster.proxy.h"
 #include "yb/master/master_ddl.proxy.h"
 #include "yb/master/master_types.pb.h"
 #include "yb/master/mini_master.h"
@@ -504,6 +505,34 @@ TEST_F(SnapshotTest, SnapshotRemoteBootstrap) {
   ASSERT_OK(cluster_->CleanTabletLogs());
 
   ASSERT_OK(ts0->Start());
+  const MonoDelta kTimeout = 20s * kTimeMultiplier;
+  ASSERT_OK(ts0->WaitStarted());
+  set<string> tablet_ids;
+  auto leader_master = ASSERT_RESULT(cluster_->GetLeaderMiniMaster());
+  auto client = ASSERT_RESULT(cluster_->CreateClient());
+  master::MasterClusterProxy master_proxy(&client->proxy_cache(), leader_master->bound_rpc_addr());
+  auto ts_map = ASSERT_RESULT(itest::CreateTabletServerMap(master_proxy, &client->proxy_cache()));
+  for (size_t i = 0; i < cluster_->num_tablet_servers(); ++i) {
+       MiniTabletServer* const ts = cluster_->mini_tablet_server(i);
+       auto ts_tablet_peers = ts->server()->tablet_manager()->GetTabletPeers();
+       for (const auto& tablet_peer : ts_tablet_peers) {
+               tablet_ids.insert(tablet_peer->tablet_id());
+       }
+  }
+  // wait for all replicas of ts0 to be bootstrapped and catch up.
+  for(auto tablet_id : tablet_ids) {
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        auto op_ids = VERIFY_RESULT(itest::GetLastOpIdForEachReplica(
+            tablet_id, TServerDetailsVector(ts_map), consensus::OpIdType::COMMITTED_OPID,
+            kTimeout));
+        SCHECK_EQ(op_ids.size(), 3, IllegalState, "Expected 3 replicas");
+
+        return op_ids[0] == op_ids[1] && op_ids[1] == op_ids[2];
+      },
+      kTimeout, "Waiting for all replicas to have the same committed op id"));
+  }
+  ASSERT_OK(cluster_->WaitForLoadBalancerToStabilize(MonoDelta::FromSeconds(20)));
   ASSERT_NO_FATALS(VerifySnapshotFiles(snapshot_id));
 }
 
