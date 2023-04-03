@@ -27,6 +27,7 @@
 #include "yb/tablet/tablet_snapshots.h"
 
 #include "yb/tserver/backup.pb.h"
+#include "yb/tserver/tserver_error.h"
 
 #include "yb/util/atomic.h"
 #include "yb/util/flags.h"
@@ -211,6 +212,14 @@ bool SnapshotState::IsTerminalFailure(const Status& status) {
   }
   // Would not be able to create snapshot at specific time, since history was garbage collected.
   if (TransactionError(status) == TransactionErrorCode::kSnapshotTooOld) {
+    return true;
+  }
+  return false;
+}
+
+bool SnapshotState::IsTerminalComplete(const Status& status) {
+  if (tserver::TabletServerError(status) == tserver::TabletServerErrorPB::TABLET_NOT_FOUND &&
+      initial_state() == SysSnapshotEntryPB::DELETING) {
     return true;
   }
   return false;

@@ -137,7 +137,7 @@ class RestorationState : public StateWithTablets {
 
  private:
   bool IsTerminalFailure(const Status& status) override;
-
+  bool IsTerminalComplete(const Status& status) override;
   Status ToEntryPB(ForClient for_client, SysRestorationEntryPB* out);
 
   SysSnapshotEntryPB::State MigrateInitialStateIfNeeded(SysSnapshotEntryPB::State initial_state);

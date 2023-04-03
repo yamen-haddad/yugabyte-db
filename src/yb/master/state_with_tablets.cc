@@ -153,17 +153,23 @@ void StateWithTablets::Done(const TabletId& tablet_id, Status status) {
     } else {
       auto full_status = status.CloneAndPrepend(
           Format("Failed to $0 snapshot at $1", InitialStateName(), tablet_id));
-      bool terminal = IsTerminalFailure(status);
-      tablets_.modify(it, [&full_status, terminal](TabletData& data) {
-        if (terminal) {
-          data.state = SysSnapshotEntryPB::FAILED;
-        }
-        data.last_error = full_status;
-      });
-      LOG_WITH_PREFIX(WARNING)
-          << full_status << ", terminal: " << terminal << ", " << num_tablets_in_initial_state_
-          << " was running";
-      if (!terminal) {
+      bool terminalFailure = IsTerminalFailure(status);
+      bool terminalComplete = IsTerminalComplete(status);
+      tablets_.modify(
+          it, [&full_status, terminalFailure, terminalComplete,
+               completeState = InitialStateToTerminalState(initial_state_)](TabletData& data) {
+            if (terminalFailure) {
+              data.state = SysSnapshotEntryPB::FAILED;
+            } else if (terminalComplete) {
+              data.state = completeState;
+            }
+            data.last_error = full_status;
+          });
+
+      LOG_WITH_PREFIX(WARNING) << full_status
+                               << ", terminal: " << (terminalFailure || terminalComplete) << ", "
+                               << num_tablets_in_initial_state_ << " was running";
+      if (!terminalFailure && !terminalComplete) {
         return;
       }
     }

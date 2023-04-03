@@ -170,6 +170,8 @@ bool RestorationState::IsTerminalFailure(const Status& status) {
          tserver::TabletServerError(status) == tserver::TabletServerErrorPB::INVALID_SNAPSHOT;
 }
 
+bool RestorationState::IsTerminalComplete(const Status& status) { return false; }
+
 Status RestorationState::ToEntryPB(ForClient for_client, SysRestorationEntryPB* out) {
   out->set_state(for_client ? VERIFY_RESULT(AggregatedState()) : initial_state());
   if (complete_time_) {

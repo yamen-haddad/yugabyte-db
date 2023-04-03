@@ -107,6 +107,7 @@ class SnapshotState : public StateWithTablets {
 
  private:
   bool IsTerminalFailure(const Status& status) override;
+  bool IsTerminalComplete(const Status& status) override;
   Status CheckDoneStatus(const Status& status) override;
 
   TxnSnapshotId id_;
