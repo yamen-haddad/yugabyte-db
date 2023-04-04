@@ -180,4 +180,33 @@ Status TestAdminClient::WaitForSnapshotComplete(const TxnSnapshotId& snapshot_id
       30s * kTimeMultiplier, "Waiting for snapshot to complete");
 }
 
+Status TestAdminClient::DeleteSnapshot(const TxnSnapshotId& snapshot_id) {
+  master::DeleteSnapshotRequestPB req;
+  master::DeleteSnapshotResponsePB resp;
+  rpc::RpcController rpc;
+  rpc.set_timeout(30s * kTimeMultiplier);
+  req.set_snapshot_id(snapshot_id.data(), snapshot_id.size());
+  auto proxy = cluster_->GetLeaderMasterProxy<master::MasterBackupProxy>();
+  RETURN_NOT_OK(proxy.DeleteSnapshot(req, &resp, &rpc));
+  RETURN_NOT_OK(ResponseStatus(resp));
+  return Status::OK();
+}
+
+Status TestAdminClient::WaitAllSnapshotsCleaned() {
+  return WaitFor(
+      [&]() -> Result<bool> {
+        master::ListSnapshotsRequestPB req;
+        master::ListSnapshotsResponsePB resp;
+        rpc::RpcController rpc;
+        rpc.set_timeout(30s * kTimeMultiplier);
+        auto proxy = cluster_->GetLeaderMasterProxy<master::MasterBackupProxy>();
+        RETURN_NOT_OK(proxy.ListSnapshots(req, &resp, &rpc));
+        if (resp.has_error()) {
+          return StatusFromPB(resp.error().status());
+        }
+        return resp.snapshots().empty();
+      },
+      30s * kTimeMultiplier, "Waiting for snapshot cleanup");
+}
+
 }  // namespace yb

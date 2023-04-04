@@ -708,6 +708,22 @@ TEST_F(YbAdminSnapshotScheduleTest, Delete) {
   }, 1s * kHistoryRetentionIntervalSec * kTimeMultiplier, "Compact SST files"));
 }
 
+TEST_F(YbAdminSnapshotScheduleTest, DeleteSnapshotAfterTabletSplitting) {
+  auto session = client_->NewSession();
+  LOG(INFO) << "Create table";
+  ASSERT_NO_FATALS(
+      client::kv_table_test::CreateTable(client::Transactional::kTrue, 3, client_.get(), &table_));
+
+  LOG(INFO) << "Write values";
+  const auto kKeys = Range(100);
+  for (auto i : kKeys) {
+    ASSERT_OK(client::kv_table_test::WriteRow(&table_, session, i, -i));
+  }
+  LOG(INFO) << "Create snpashot";
+  // auto snapshot_id = ASSERT_RESULT(test_admin_client_->CreateSnapshotAndWait());
+  LOG(INFO) << "Create snpashot";
+}
+
 // Modifies the interval of a snapshot schedule and uses the number of snapshots in the schedule as
 // proxy to verify the update was successfully applied.
 TEST_F(YbAdminSnapshotScheduleTest, EditInterval) {
