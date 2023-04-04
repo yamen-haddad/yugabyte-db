@@ -69,7 +69,7 @@ Status TestAdminClient::SplitTabletAndWait(
   RETURN_NOT_OK(SplitTablet(table, tablet_id));
   return (WaitFor(
       [&]() -> Result<bool> { return IsTabletSplittingComplete(wait_for_parent_deletion); },
-      30s * kTimeMultiplier, "Wait for ongoing splits to finish."));
+      60s * kTimeMultiplier, "Wait for ongoing splits to finish."));
 }
 
 Status TestAdminClient::SplitTabletAndWait(
@@ -151,6 +151,7 @@ Result<TxnSnapshotId> TestAdminClient::CreateSnapshot(
   master::CreateSnapshotResponsePB resp;
   rpc::RpcController rpc;
   rpc.set_timeout(30s * kTimeMultiplier);
+  req.set_transaction_aware(true);
   if (schedule_id) {
     req.set_schedule_id(schedule_id->data(), schedule_id->size());
   }

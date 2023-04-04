@@ -121,6 +121,44 @@ TEST_F_EX(YBBackupTest,
   LOG(INFO) << "Test finished: " << CURRENT_TEST_CASE_AND_TEST_NAME_STR();
 }
 
+// Test delete_snapshot operation, where one of the tablets involved in the delete snapshot
+// operation is already deleted (For example: due to tablet splitting).
+// 1. create a table with 3 pre-split tablets.
+// 2. create a database snapshot
+// 3. split one of the tablets to make 4 tablets
+// 4. delete the snapshot created at 2
+TEST_F(YBBackupTest, DeleteSnapshotAfterTabletSplitting) {
+  const string table_name = "mytbl";
+  const string default_db = "yugabyte";
+  LOG(INFO) << Format("YAMEN: Create table '$0'", table_name);
+  ASSERT_NO_FATALS(CreateTable(Format("CREATE TABLE $0 (k INT, v INT)", table_name)));
+  LOG(INFO) << "YAMEN: Insert values";
+  ASSERT_NO_FATALS(InsertRows(
+      Format("INSERT INTO $0 (k,v) SELECT i,i FROM generate_series(1,100) AS i", table_name), 100));
+  LOG(INFO) << "YAMEN: Create snpashot";
+  auto snapshot_id = ASSERT_RESULT(test_admin_client_->CreateSnapshotAndWait());
+  LOG(INFO) << "Split one tablet Manually and wait for parent tablet to be deleted.";
+  auto tablets = ASSERT_RESULT(test_admin_client_->GetTabletLocations(default_db, table_name));
+  LogTabletsInfo(tablets);
+  ASSERT_EQ(tablets.size(), 3);
+  constexpr int middle_index = 1;
+  ASSERT_EQ(tablets[middle_index].partition().partition_key_start(), "\x55\x55");
+  string tablet_id = tablets[middle_index].tablet_id();
+  // Split it && Wait for split to complete.
+  constexpr int num_tablets = 4;
+  ASSERT_OK(test_admin_client_->SplitTabletAndWait(
+      default_db, table_name, /* wait_for_parent_deletion */ true, tablet_id));
+  LOG(INFO) << "YAMEN: Finish tablet splitting";
+  tablets = ASSERT_RESULT(test_admin_client_->GetTabletLocations(default_db, table_name));
+  LogTabletsInfo(tablets);
+  ASSERT_EQ(tablets.size(), num_tablets);
+  // Delete the snapshot after the parent tablet has been deleted
+  LOG(INFO) << "YAMEN: Delete snapshot";
+  ASSERT_OK(test_admin_client_->DeleteSnapshot(snapshot_id));
+  // Make sure the snapshot has been cleanedup
+  ASSERT_OK(test_admin_client_->WaitAllSnapshotsCleaned());
+}
+
 // Test backup/restore when a hash-partitioned table undergoes manual tablet splitting.  Most
 // often, if tablets are split after creation, the partition boundaries will not be evenly spaced.
 // This then differs from the boundaries of a hash table that is pre-split with the same number of

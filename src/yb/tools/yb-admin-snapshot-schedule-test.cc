@@ -709,16 +709,18 @@ TEST_F(YbAdminSnapshotScheduleTest, Delete) {
 }
 
 TEST_F(YbAdminSnapshotScheduleTest, DeleteSnapshotAfterTabletSplitting) {
+  ASSERT_OK(PrepareCommon());
+  auto conn = ASSERT_RESULT(PgConnect());
+  LOG(INFO) << Format("Create table '$0'", client::kTableName);
+  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (key INT, value INT)", client::kTableName));
   auto session = client_->NewSession();
   LOG(INFO) << "Create table";
   ASSERT_NO_FATALS(
       client::kv_table_test::CreateTable(client::Transactional::kTrue, 3, client_.get(), &table_));
 
-  LOG(INFO) << "Write values";
-  const auto kKeys = Range(100);
-  for (auto i : kKeys) {
-    ASSERT_OK(client::kv_table_test::WriteRow(&table_, session, i, -i));
-  }
+  LOG(INFO) << "Insert values";
+  ASSERT_OK(conn.ExecuteFormat(
+      "INSERT INTO $0 (key, value) SELECT i,i FROM generate_series(1,100)", client::kTableName));
   LOG(INFO) << "Create snpashot";
   // auto snapshot_id = ASSERT_RESULT(test_admin_client_->CreateSnapshotAndWait());
   LOG(INFO) << "Create snpashot";
