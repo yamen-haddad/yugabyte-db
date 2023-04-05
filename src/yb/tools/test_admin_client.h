@@ -66,16 +66,10 @@ class TestAdminClient {
 
   Status FlushTable(const std::string& ns, const std::string& table);
 
-  Result<TxnSnapshotId> CreateSnapshotAndWait(
-      const std::optional<SnapshotScheduleId>& schedule_id = std::nullopt);
+  Result<TxnSnapshotId> CreateSnapshotAndWait(const SnapshotScheduleId& schedule_id);
 
-  Result<TxnSnapshotId> CreateSnapshot(
-      const std::optional<SnapshotScheduleId>& schedule_id = std::nullopt);
-  Status WaitForSnapshotToBeInState(
-      const TxnSnapshotId& snapshot_id, const master::SysSnapshotEntryPB::State& snapshot_state);
+  Result<TxnSnapshotId> CreateSnapshot(const SnapshotScheduleId& schedule_id);
   Status WaitForSnapshotComplete(const TxnSnapshotId& snapshot_id);
-  Status DeleteSnapshot(const TxnSnapshotId& snapshot_id);
-  Status WaitAllSnapshotsCleaned();
 
  private:
   ExternalMiniCluster* cluster_;

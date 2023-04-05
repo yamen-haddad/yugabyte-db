@@ -139,22 +139,18 @@ Status TestAdminClient::FlushTable(const std::string& ns, const std::string& tab
 }
 
 Result<TxnSnapshotId> TestAdminClient::CreateSnapshotAndWait(
-    const std::optional<SnapshotScheduleId>& schedule_id) {
+    const SnapshotScheduleId& schedule_id) {
   TxnSnapshotId snapshot_id = VERIFY_RESULT(CreateSnapshot(schedule_id));
   RETURN_NOT_OK(WaitForSnapshotComplete(snapshot_id));
   return snapshot_id;
 }
 
-Result<TxnSnapshotId> TestAdminClient::CreateSnapshot(
-    const std::optional<SnapshotScheduleId>& schedule_id) {
+Result<TxnSnapshotId> TestAdminClient::CreateSnapshot(const SnapshotScheduleId& schedule_id) {
   master::CreateSnapshotRequestPB req;
   master::CreateSnapshotResponsePB resp;
   rpc::RpcController rpc;
   rpc.set_timeout(30s * kTimeMultiplier);
-  req.set_transaction_aware(true);
-  if (schedule_id) {
-    req.set_schedule_id(schedule_id->data(), schedule_id->size());
-  }
+  req.set_schedule_id(schedule_id.data(), schedule_id.size());
   auto proxy = cluster_->GetLeaderMasterProxy<master::MasterBackupProxy>();
   RETURN_NOT_OK(proxy.CreateSnapshot(req, &resp, &rpc));
   if (resp.has_error()) {
@@ -179,35 +175,6 @@ Status TestAdminClient::WaitForSnapshotComplete(const TxnSnapshotId& snapshot_id
         return resp.snapshots(0).entry().state() == master::SysSnapshotEntryPB::COMPLETE;
       },
       30s * kTimeMultiplier, "Waiting for snapshot to complete");
-}
-
-Status TestAdminClient::DeleteSnapshot(const TxnSnapshotId& snapshot_id) {
-  master::DeleteSnapshotRequestPB req;
-  master::DeleteSnapshotResponsePB resp;
-  rpc::RpcController rpc;
-  rpc.set_timeout(30s * kTimeMultiplier);
-  req.set_snapshot_id(snapshot_id.data(), snapshot_id.size());
-  auto proxy = cluster_->GetLeaderMasterProxy<master::MasterBackupProxy>();
-  RETURN_NOT_OK(proxy.DeleteSnapshot(req, &resp, &rpc));
-  RETURN_NOT_OK(ResponseStatus(resp));
-  return Status::OK();
-}
-
-Status TestAdminClient::WaitAllSnapshotsCleaned() {
-  return WaitFor(
-      [&]() -> Result<bool> {
-        master::ListSnapshotsRequestPB req;
-        master::ListSnapshotsResponsePB resp;
-        rpc::RpcController rpc;
-        rpc.set_timeout(30s * kTimeMultiplier);
-        auto proxy = cluster_->GetLeaderMasterProxy<master::MasterBackupProxy>();
-        RETURN_NOT_OK(proxy.ListSnapshots(req, &resp, &rpc));
-        if (resp.has_error()) {
-          return StatusFromPB(resp.error().status());
-        }
-        return resp.snapshots().empty();
-      },
-      30s * kTimeMultiplier, "Waiting for snapshot cleanup");
 }
 
 }  // namespace yb

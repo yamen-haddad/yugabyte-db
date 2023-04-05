@@ -130,33 +130,37 @@ TEST_F_EX(YBBackupTest,
 TEST_F(YBBackupTest, DeleteSnapshotAfterTabletSplitting) {
   const string table_name = "mytbl";
   const string default_db = "yugabyte";
-  LOG(INFO) << Format("YAMEN: Create table '$0'", table_name);
+  LOG(INFO) << Format("Create table '$0'", table_name);
   ASSERT_NO_FATALS(CreateTable(Format("CREATE TABLE $0 (k INT, v INT)", table_name)));
-  LOG(INFO) << "YAMEN: Insert values";
+  LOG(INFO) << "Insert values";
   ASSERT_NO_FATALS(InsertRows(
-      Format("INSERT INTO $0 (k,v) SELECT i,i FROM generate_series(1,100) AS i", table_name), 100));
-  LOG(INFO) << "YAMEN: Create snpashot";
-  auto snapshot_id = ASSERT_RESULT(test_admin_client_->CreateSnapshotAndWait());
-  LOG(INFO) << "Split one tablet Manually and wait for parent tablet to be deleted.";
+      Format("INSERT INTO $0 (k,v) SELECT i,i FROM generate_series(1,10000) AS i", table_name),
+      10000));
+  // Verify tablets count and get table_id
   auto tablets = ASSERT_RESULT(test_admin_client_->GetTabletLocations(default_db, table_name));
   LogTabletsInfo(tablets);
   ASSERT_EQ(tablets.size(), 3);
   constexpr int middle_index = 1;
+  TableId table_id = tablets[0].table_id();
+  LOG(INFO) << "Create snapshot";
+  auto snapshot_id = ASSERT_RESULT(snapshot_util_->CreateSnapshot(table_id));
+  LOG(INFO) << "Split one tablet Manually and wait for parent tablet to be deleted.";
   ASSERT_EQ(tablets[middle_index].partition().partition_key_start(), "\x55\x55");
   string tablet_id = tablets[middle_index].tablet_id();
   // Split it && Wait for split to complete.
   constexpr int num_tablets = 4;
   ASSERT_OK(test_admin_client_->SplitTabletAndWait(
       default_db, table_name, /* wait_for_parent_deletion */ true, tablet_id));
-  LOG(INFO) << "YAMEN: Finish tablet splitting";
+  LOG(INFO) << "Finish tablet splitting";
   tablets = ASSERT_RESULT(test_admin_client_->GetTabletLocations(default_db, table_name));
   LogTabletsInfo(tablets);
   ASSERT_EQ(tablets.size(), num_tablets);
   // Delete the snapshot after the parent tablet has been deleted
-  LOG(INFO) << "YAMEN: Delete snapshot";
-  ASSERT_OK(test_admin_client_->DeleteSnapshot(snapshot_id));
-  // Make sure the snapshot has been cleanedup
-  ASSERT_OK(test_admin_client_->WaitAllSnapshotsCleaned());
+  LOG(INFO) << "Delete snapshot";
+  ASSERT_OK(snapshot_util_->DeleteSnapshot(snapshot_id));
+  // Make sure the snapshot has been deleted
+  LOG(INFO) << "Wait snapshot to be Deleted";
+  ASSERT_OK(snapshot_util_->WaitAllSnapshotsDeleted());
 }
 
 // Test backup/restore when a hash-partitioned table undergoes manual tablet splitting.  Most
