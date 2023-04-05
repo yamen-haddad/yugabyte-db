@@ -143,11 +143,9 @@ class StateWithTablets {
   }
 
   const std::string& LogPrefix() const;
-  // Whether status leads to a terminal with failure state.
-  virtual bool IsTerminalFailure(const Status& status) = 0;
-
-  // Whether status leads to a terminal with complete state.
-  virtual bool IsTerminalComplete(const Status& status) = 0;
+  // Determine whether we can transition to a terminal state
+  virtual std::optional<SysSnapshotEntryPB::State> GetTerminalStateForStatus(
+      const Status& status) = 0;
 
   virtual Status CheckDoneStatus(const Status& status) {
     return status;

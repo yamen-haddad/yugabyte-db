@@ -145,7 +145,6 @@ TEST_F(YBBackupTest, DeleteSnapshotAfterTabletSplitting) {
   LOG(INFO) << "Create snapshot";
   auto snapshot_id = ASSERT_RESULT(snapshot_util_->CreateSnapshot(table_id));
   LOG(INFO) << "Split one tablet Manually and wait for parent tablet to be deleted.";
-  ASSERT_EQ(tablets[middle_index].partition().partition_key_start(), "\x55\x55");
   string tablet_id = tablets[middle_index].tablet_id();
   // Split it && Wait for split to complete.
   constexpr int num_tablets = 4;

@@ -165,12 +165,14 @@ void RestorationState::PrepareOperations(
   });
 }
 
-bool RestorationState::IsTerminalFailure(const Status& status) {
-  return status.IsAborted() ||
-         tserver::TabletServerError(status) == tserver::TabletServerErrorPB::INVALID_SNAPSHOT;
+std::optional<SysSnapshotEntryPB::State> RestorationState::GetTerminalStateForStatus(
+    const Status& status) {
+  if (status.IsAborted() ||
+      tserver::TabletServerError(status) == tserver::TabletServerErrorPB::INVALID_SNAPSHOT) {
+    return SysSnapshotEntryPB::FAILED;
+  }
+  return std::nullopt;
 }
-
-bool RestorationState::IsTerminalComplete(const Status& status) { return false; }
 
 Status RestorationState::ToEntryPB(ForClient for_client, SysRestorationEntryPB* out) {
   out->set_state(for_client ? VERIFY_RESULT(AggregatedState()) : initial_state());
