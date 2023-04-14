@@ -75,6 +75,7 @@ class AsyncTabletSnapshotOp : public RetryingTSRpcTask {
 
   void HandleResponse(int attempt) override;
   bool SendRequest(int attempt) override;
+  bool ConsideredCompleteDespiteErrorStatus(const Status& status) override;
   void Finished(const Status& status) override;
   bool RetryAllowed(tserver::TabletServerErrorPB::Code code, const Status& status);
 

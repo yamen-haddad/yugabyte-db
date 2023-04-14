@@ -178,6 +178,9 @@ class RetryingTSRpcTask : public server::MonitoredTask {
   // Transition this task state from expected to failed with specified status.
   void TransitionToFailedState(server::MonitoredTaskState expected, const Status& status);
 
+  // Some tasks should be considered as Complete when status is not ok
+  virtual bool ConsideredCompleteDespiteErrorStatus(const Status& status) { return false; }
+
   virtual void Finished(const Status& status) {}
 
   void AbortTask(const Status& status);

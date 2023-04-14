@@ -187,6 +187,14 @@ bool AsyncTabletSnapshotOp::SendRequest(int attempt) {
   return true;
 }
 
+bool AsyncTabletSnapshotOp::ConsideredCompleteDespiteErrorStatus(const Status& status) {
+  // Deleting an already deleted tablet snapshot
+  if (status.IsNotFound() && operation_ == tserver::TabletSnapshotOpRequestPB::DELETE_ON_TABLET) {
+    return true;
+  }
+  return false;
+}
+
 void AsyncTabletSnapshotOp::Finished(const Status& status) {
   if (!callback_) {
     return;

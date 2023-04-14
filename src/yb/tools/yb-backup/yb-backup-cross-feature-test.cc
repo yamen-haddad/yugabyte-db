@@ -208,7 +208,7 @@ TEST_F_EX(
   ASSERT_EQ(tablets.size(), num_tablets);
   // Perform a master failover. the new master will not have any state for this deleted parent
   // tablet.
-  LOG(INFO) << "Failing over the master leader";
+  LOG(INFO) << "Fail over the master leader";
   ASSERT_OK(cluster_->StepDownMasterLeaderAndWaitForNewLeader());
   // Delete the snapshot after the parent tablet has been deleted
   LOG(INFO) << "Delete snapshot";

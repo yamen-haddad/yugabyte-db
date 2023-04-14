@@ -197,6 +197,11 @@ Status RetryingTSRpcTask::Run() {
       UnregisterAsyncTask();
       return s;
     }
+    if (ConsideredCompleteDespiteErrorStatus(s)) {
+      TransitionToTerminalState(
+          MonitoredTaskState::kWaiting, MonitoredTaskState::kComplete, Status::OK());
+      return Status::OK();
+    }
     if (RescheduleWithBackoffDelay()) {
       return Status::OK();
     }
