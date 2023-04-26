@@ -188,7 +188,17 @@ Status RetryingTSRpcTask::Run() {
     std::this_thread::yield();
   }
 
-  Status s = ResetTSProxy();
+  auto s = replica_picker_->PickReplica(&target_ts_desc_);
+  if (!s.ok()) {
+    auto opt_transition = HandleReplicaLookupFailure(s);
+    if (opt_transition) {
+      TransitionToTerminalState(
+          MonitoredTaskState::kWaiting, opt_transition->first, opt_transition->second);
+      return opt_transition->second;
+    }
+  } else {
+    s = ResetTSProxy();
+  }
   if (!s.ok()) {
     s = s.CloneAndPrepend("Failed to reset TS proxy");
     LOG_WITH_PREFIX(INFO) << s;
@@ -196,11 +206,6 @@ Status RetryingTSRpcTask::Run() {
       TransitionToTerminalState(MonitoredTaskState::kWaiting, MonitoredTaskState::kFailed, s);
       UnregisterAsyncTask();
       return s;
-    }
-    if (ConsideredCompleteDespiteErrorStatus(s)) {
-      TransitionToTerminalState(
-          MonitoredTaskState::kWaiting, MonitoredTaskState::kComplete, Status::OK());
-      return Status::OK();
     }
     if (RescheduleWithBackoffDelay()) {
       return Status::OK();
@@ -503,9 +508,6 @@ void RetryingTSRpcTask::AbortIfScheduled() {
 }
 
 Status RetryingTSRpcTask::ResetTSProxy() {
-  // TODO: if there is no replica available, should we still keep the task running?
-  RETURN_NOT_OK(replica_picker_->PickReplica(&target_ts_desc_));
-
   shared_ptr<tserver::TabletServerServiceProxy> ts_proxy;
   shared_ptr<tserver::TabletServerAdminServiceProxy> ts_admin_proxy;
   shared_ptr<consensus::ConsensusServiceProxy> consensus_proxy;
