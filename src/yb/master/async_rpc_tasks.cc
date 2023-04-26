@@ -194,6 +194,7 @@ Status RetryingTSRpcTask::Run() {
     if (opt_transition) {
       TransitionToTerminalState(
           MonitoredTaskState::kWaiting, opt_transition->first, opt_transition->second);
+      UnregisterAsyncTask();
       return opt_transition->second;
     }
   } else {
