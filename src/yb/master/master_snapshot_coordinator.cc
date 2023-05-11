@@ -31,6 +31,7 @@
 
 #include "yb/master/async_snapshot_tasks.h"
 #include "yb/master/catalog_entity_info.h"
+#include "yb/master/master_ddl.pb.h"
 #include "yb/master/master_error.h"
 #include "yb/master/master_heartbeat.pb.h"
 #include "yb/master/master_util.h"
@@ -1235,6 +1236,8 @@ class MasterSnapshotCoordinator::Impl {
     }
     auto tablet_infos = context_.GetTabletInfos(tablet_ids);
     for (size_t i = 0; i != num_operations; ++i) {
+      LOG(INFO) << Format(
+          "ExecuteRestoreOperation(operation: $0,tablet_infos: $1)", i, tablet_infos[i]);
       ExecuteRestoreOperation(
           operations[i], tablet_infos[i], leader_term);
     }
@@ -1262,14 +1265,23 @@ class MasterSnapshotCoordinator::Impl {
   void ExecuteRestoreOperation(
       const TabletRestoreOperation& operation, const TabletInfoPtr& tablet_info,
       int64_t leader_term) {
+    auto callback = MakeDoneCallback(
+        &mutex_, restorations_, operation.restoration_id, operation.tablet_id,
+        std::bind(&Impl::FinishRestoration, this, _1, leader_term));
+    if (!tablet_info) {
+      callback(STATUS_EC_FORMAT(
+          NotFound, MasterError(MasterErrorPB::TABLET_NOT_RUNNING), "Tablet info not found for $0",
+          operation.tablet_id));
+      return;
+    }
     auto snapshot_id_str = operation.snapshot_id.AsSlice().ToBuffer();
     // If this tablet did not participate in snapshot, i.e. was deleted.
     // We just change hybrid time limit and clear hide state.
+    LOG(INFO) << Format(" inside ExecuteRestoreOperation(tablet_infos:$0)", tablet_info);
+    LOG(INFO) << Format("CreateAsyncTabletSnapshotOp");
     auto task = context_.CreateAsyncTabletSnapshotOp(
         tablet_info, operation.is_tablet_part_of_snapshot ? snapshot_id_str : std::string(),
-        tserver::TabletSnapshotOpRequestPB::RESTORE_ON_TABLET,
-        MakeDoneCallback(&mutex_, restorations_, operation.restoration_id, operation.tablet_id,
-                          std::bind(&Impl::FinishRestoration, this, _1, leader_term)));
+        tserver::TabletSnapshotOpRequestPB::RESTORE_ON_TABLET, callback);
     task->SetSnapshotHybridTime(operation.restore_at);
     task->SetRestorationId(operation.restoration_id);
     if (!operation.schedule_id.IsNil()) {
@@ -1730,10 +1742,11 @@ class MasterSnapshotCoordinator::Impl {
     if (FLAGS_TEST_skip_sending_restore_finished) {
       return;
     }
-
+    // YAMEN TODO: only get the tablets whose state is restored
     auto temp_ids = restoration->tablet_ids();
     std::vector<TabletId> tablet_ids(temp_ids.begin(), temp_ids.end());
     auto tablets = context_.GetTabletInfos(tablet_ids);
+    // YAMEN TODO: check for null values to avoid cluster crash
     for (const auto& tablet : tablets) {
       auto task = context_.CreateAsyncTabletSnapshotOp(
           tablet, std::string(), tserver::TabletSnapshotOpRequestPB::RESTORE_FINISHED,
@@ -1870,6 +1883,87 @@ class MasterSnapshotCoordinator::Impl {
       if (restore_sys_catalog) {
         RETURN_NOT_OK(ForwardRestoreCheck(snapshot, restore_at, restoration_id));
       }
+      // else {
+      //   // As this is not PITR, check the restore snapshot is applicable on this database, that
+      //   // means: The current database tables and the snapshot tables have the same schema.
+      //   // get all the user tables that are in the database.
+      //   SnapshotInfoPB snapshot_info;
+      //   RETURN_NOT_OK(snapshot.ToPB(&snapshot_info, ListSnapshotsDetailOptionsPB()));
+      //   LOG(INFO) << "YAMEN: SnapshotInfoPB is: " << snapshot_info.DebugString();
+      //   NamespaceId snapshot_ns_id;
+      //   std::unordered_map<TableId, Schema> snapshot_tables_schemas;
+      //   for (const SysRowEntry& entry : snapshot_info.entry().entries()) {
+      //     if (entry.type() == SysRowEntryType::NAMESPACE) {
+      //       snapshot_ns_id = entry.id();
+      //     }
+      //     // to copy in another loop outside
+      //     if (entry.type() == SysRowEntryType::TABLE) {  // Recreate TABLE.
+      //       // SysTablesEntryPB table;
+      //       // const string& data = entry.data();
+      //       // RETURN_NOT_OK(pb_util::ParseFromArray(&table, to_uchar_ptr(data.data()),
+      //       // data.size()));
+      //       SysTablesEntryPB table =
+      //           VERIFY_RESULT(pb_util::ParseFromSlice<SysTablesEntryPB>(entry.data()));
+      //       LOG(INFO) << "YAMEN Showing tables info of the snapshot: " << table.DebugString();
+      //       // Do not add the colocated parent table
+      //       if (!table.colocated() || table.has_parent_table_id()) {
+      //         // LOG(INFO) << "inserting table: " << table.name() << "inside the map";
+      //         Schema table_schema;
+      //         RETURN_NOT_OK(SchemaFromPB(table.schema(), &table_schema));
+      //         snapshot_tables_schemas[entry.id()] = table_schema;
+      //       }
+      //     }
+      //   }
+      //   LOG(INFO) << "printing the map of snapshot tables.";
+      //   for (auto table_schema : snapshot_tables_schemas) {
+      //     LOG(INFO) << Format("(tableID,Schema)=($0,$1)", table_schema.first,
+      //     table_schema.second);
+      //   }
+      //   if (snapshot_ns_id.empty()) {
+      //     return STATUS(NotFound, Format("Namespace id of snapshot: $0 not found", snapshot_id));
+      //   }
+      //   ListTablesRequestPB listTablesReq;
+      //   ListTablesResponsePB listTablesResp;
+      //   listTablesReq.mutable_namespace_()->set_id(snapshot_ns_id);
+      //   listTablesReq.mutable_namespace_()->set_database_type(YQL_DATABASE_PGSQL);
+      //   listTablesReq.set_exclude_system_tables(true);
+      //   RETURN_NOT_OK(context_.ListTables(&listTablesReq, &listTablesResp));
+      //   LOG(INFO) << "Yamen: printing the current database tables:";
+      //   // Get the table schema for each table.
+      //   for (const auto& t : listTablesResp.tables()) {
+      //     LOG(INFO) << "YAMEN: table: " << t.DebugString();
+      //     if (snapshot_tables_schemas.find(t.id()) == snapshot_tables_schemas.end()) {
+      //       return STATUS(
+      //           NotFound, Format(
+      //                         "Table $0 in current database was not found in snapshot $1",
+      //                         t.id(), snapshot_id));
+      //     }
+      //     Schema snapshot_table_schema = snapshot_tables_schemas.find(t.id())->second;
+      //     // Now we can get the schema for this table.
+      //     GetTableSchemaRequestPB schemaReq;
+      //     GetTableSchemaResponsePB schemaResp;
+      //     schemaReq.mutable_table()->set_table_id(t.id());
+      //     RETURN_NOT_OK(context_.GetTableSchema(&schemaReq, &schemaResp));
+      //     Schema current_table_schema;
+      //     RETURN_NOT_OK(SchemaFromPB(schemaResp.schema(), &current_table_schema));
+      //     if (!current_table_schema.EquivalentForDataCopy(snapshot_table_schema)) {
+      //       return STATUS(
+      //           IllegalState, Format(
+      //                             "Table $0 has different schema in current database "
+      //                             "compared to the snapshot schema",
+      //                             t.id()));
+      //     }
+      //     // remove table schema from snapshot_tables_schemas
+      //     snapshot_tables_schemas.erase(t.id());
+      //   }
+      //   if (!snapshot_tables_schemas.empty()) {
+      //     return STATUS(
+      //         NotFound, Format(
+      //                       "Unable to restore snapshot $0: $1 Tables existed in the snapshot but
+      //                       " "not found in current database", snapshot_id,
+      //                       snapshot_tables_schemas.size()));
+      //   }
+      // }
       // Get the restoration state. Construct if in initial phase.
       RestorationState* restoration_ptr;
       if (phase == RestorePhase::kInitial) {

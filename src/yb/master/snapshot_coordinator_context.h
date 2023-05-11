@@ -21,6 +21,7 @@
 
 #include "yb/master/master_fwd.h"
 #include "yb/master/master_types.pb.h"
+#include "yb/master/master_ddl.fwd.h"
 
 #include "yb/rpc/rpc_fwd.h"
 
@@ -48,7 +49,10 @@ class SnapshotCoordinatorContext {
   // The returned vector is always of the same length as the input vector,
   // with null entries returned for unknown tablet ids.
   virtual TabletInfos GetTabletInfos(const std::vector<TabletId>& id) = 0;
-
+  // List all the running tables.
+  virtual Status ListTables(const ListTablesRequestPB* req, ListTablesResponsePB* resp) = 0;
+  virtual Status GetTableSchema(
+      const GetTableSchemaRequestPB* req, GetTableSchemaResponsePB* resp) = 0;
   virtual AsyncTabletSnapshotOpPtr CreateAsyncTabletSnapshotOp(
       const TabletInfoPtr& tablet, const std::string& snapshot_id,
       tserver::TabletSnapshotOpRequestPB::Operation operation,
