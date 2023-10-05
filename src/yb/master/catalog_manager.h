@@ -1170,6 +1170,10 @@ class CatalogManager : public tserver::TabletPeerLookupIf,
       rpc::RpcContext* rpc,
       const LeaderEpoch& epoch);
 
+  Status ExportSnapshot(
+      const ExportSnapshotRequestPB* req, ExportSnapshotResponsePB* resp, rpc::RpcContext* rpc,
+      const LeaderEpoch& epoch);
+
   Status CreateSnapshotSchedule(
       const CreateSnapshotScheduleRequestPB* req,
       CreateSnapshotScheduleResponsePB* resp,

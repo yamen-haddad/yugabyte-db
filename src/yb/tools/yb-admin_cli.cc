@@ -1501,18 +1501,39 @@ Status restore_snapshot_action(
   return Status::OK();
 }
 
-const auto export_snapshot_args = "<snapshot_id> <file_name>";
+const auto export_snapshot_args =
+    "<snapshot_id> <output_file_name> [<master_tablet_location> <namespace_id> <read_time>]";
 Status export_snapshot_action(
     const ClusterAdminCli::CLIArguments& args, ClusterAdminClient* client) {
-  if (args.size() != 2) {
+  if (args.size() < 2 || args.size() > 5) {
     return ClusterAdminCli::kInvalidArguments;
   }
 
   const string snapshot_id = args[0];
-  const string file_name = args[1];
+  const string output_file_name = args[1];
+  if (args.size() == 2) {
+    RETURN_NOT_OK_PREPEND(
+        client->CreateSnapshotMetaFile(snapshot_id, output_file_name),
+        Format("Unable to export snapshot $0 to file $1", snapshot_id, output_file_name));
+  }
+  string master_tablet_location = "";
+  HybridTime read_time = HybridTime::kMax;
+  string namespace_id = "";
+  if (args.size() >= 3) {
+    master_tablet_location = args[2];
+  }
+  if (args.size() >= 4) {
+    namespace_id = args[3];
+  }
+  if (args.size() == 5) {
+    read_time = VERIFY_RESULT(HybridTime::ParseHybridTime(args[4]));
+  }
+  std::cout << "Exporting snapshot: " << snapshot_id << " stored at: " << master_tablet_location
+            << " read time is: " << read_time << "\n";
   RETURN_NOT_OK_PREPEND(
-      client->CreateSnapshotMetaFile(snapshot_id, file_name),
-      Format("Unable to export snapshot $0 to file $1", snapshot_id, file_name));
+      client->CreateSnapshotMetaFile(
+          snapshot_id, output_file_name, master_tablet_location, namespace_id, read_time),
+      Format("Unable to export snapshot $0 to file $1", snapshot_id, output_file_name));
   return Status::OK();
 }
 

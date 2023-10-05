@@ -351,12 +351,15 @@ class ClusterAdminClient {
   Status DeleteSnapshot(const std::string& snapshot_id);
   Status AbortSnapshotRestore(const TxnSnapshotRestorationId& restoration_id);
 
-  Status CreateSnapshotMetaFile(const std::string& snapshot_id,
-                                const std::string& file_name);
+  Status CreateSnapshotMetaFile(
+      const std::string& snapshot_id, const std::string& output_file_name,
+      const std::string& master_tablet_location = "", const std::string& namespace_id = "",
+      const HybridTime& read_time = HybridTime::kMax);
   Status ImportSnapshotMetaFile(const std::string& file_name,
                                 const TypedNamespaceName& keyspace,
                                 const std::vector<client::YBTableName>& tables,
                                 bool selective_import);
+  Status ExportSnapshot();
   Status ListReplicaTypeCounts(const client::YBTableName& table_name);
 
   Status SetPreferredZones(const std::vector<std::string>& preferred_zones);

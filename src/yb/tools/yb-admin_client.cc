@@ -158,13 +158,15 @@ using consensus::RaftPeerPB;
 using consensus::RunLeaderElectionRequestPB;
 using consensus::RunLeaderElectionResponsePB;
 
+using master::AbortSnapshotRestoreRequestPB;
+using master::AbortSnapshotRestoreResponsePB;
 using master::BackupRowEntryPB;
 using master::CreateSnapshotRequestPB;
 using master::CreateSnapshotResponsePB;
 using master::DeleteSnapshotRequestPB;
 using master::DeleteSnapshotResponsePB;
-using master::AbortSnapshotRestoreRequestPB;
-using master::AbortSnapshotRestoreResponsePB;
+using master::ExportSnapshotRequestPB;
+using master::ExportSnapshotResponsePB;
 using master::IdPairPB;
 using master::ImportSnapshotMetaRequestPB;
 using master::ImportSnapshotMetaResponsePB;
@@ -2826,61 +2828,79 @@ Status ClusterAdminClient::AbortSnapshotRestore(const TxnSnapshotRestorationId& 
 }
 
 Status ClusterAdminClient::CreateSnapshotMetaFile(
-    const string& snapshot_id, const string& file_name) {
-  ListSnapshotsResponsePB resp;
-  RETURN_NOT_OK(RequestMasterLeader(&resp, [&](RpcController* rpc) {
-    ListSnapshotsRequestPB req;
-    req.set_snapshot_id(StringToSnapshotId(snapshot_id));
-
-    // Format 0 - latest format (== Format 2 at the moment).
-    // Format -1 - old format (no 'namespace_name' in the Table entry).
-    // Format 1 - old format.
-    // Format 2 - new format.
-    if (FLAGS_TEST_metadata_file_format_version == 0 ||
-        FLAGS_TEST_metadata_file_format_version >= 2) {
-      req.set_prepare_for_backup(true);
-    }
-    return master_backup_proxy_->ListSnapshots(req, &resp, rpc);
-  }));
-
-  if (resp.snapshots_size() > 1) {
-        LOG(WARNING) << "Requested snapshot metadata for snapshot '" << snapshot_id << "', but got "
-                     << resp.snapshots_size() << " snapshots in the response";
-  }
-
+    const string& snapshot_id, const std::string& output_file_name,
+    const std::string& master_tablet_location, const std::string& namespace_id,
+    const HybridTime& read_time) {
   SnapshotInfoPB* snapshot = nullptr;
-  for (SnapshotInfoPB& snapshot_entry : *resp.mutable_snapshots()) {
-        if (SnapshotIdToString(snapshot_entry.id()) == snapshot_id) {
-      snapshot = &snapshot_entry;
-      break;
-        }
-  }
-  if (!snapshot) {
-        return STATUS_FORMAT(
-            InternalError, "Response contained $0 entries but no entry for snapshot '$1'",
-            resp.snapshots_size(), snapshot_id);
-  }
+  if (master_tablet_location == "") {
+        ListSnapshotsResponsePB resp;
+        RETURN_NOT_OK(RequestMasterLeader(&resp, [&](RpcController* rpc) {
+          ListSnapshotsRequestPB req;
+          req.set_snapshot_id(StringToSnapshotId(snapshot_id));
 
-  if (FLAGS_TEST_metadata_file_format_version == -1) {
-        // Remove 'namespace_name' from SysTablesEntryPB.
-        SysSnapshotEntryPB& sys_entry = *snapshot->mutable_entry();
-        for (SysRowEntry& entry : *sys_entry.mutable_entries()) {
-      if (entry.type() == SysRowEntryType::TABLE) {
-        auto meta = VERIFY_RESULT(ParseFromSlice<SysTablesEntryPB>(entry.data()));
-        meta.clear_namespace_name();
-        entry.set_data(meta.SerializeAsString());
+          // Format 0 - latest format (== Format 2 at the moment).
+          // Format -1 - old format (no 'namespace_name' in the Table entry).
+          // Format 1 - old format.
+          // Format 2 - new format.
+          if (FLAGS_TEST_metadata_file_format_version == 0 ||
+              FLAGS_TEST_metadata_file_format_version >= 2) {
+            req.set_prepare_for_backup(true);
+          }
+          return master_backup_proxy_->ListSnapshots(req, &resp, rpc);
+        }));
+
+        if (resp.snapshots_size() > 1) {
+      LOG(WARNING) << "Requested snapshot metadata for snapshot '" << snapshot_id << "', but got "
+                   << resp.snapshots_size() << " snapshots in the response";
+        }
+
+        for (SnapshotInfoPB& snapshot_entry : *resp.mutable_snapshots()) {
+      if (SnapshotIdToString(snapshot_entry.id()) == snapshot_id) {
+        snapshot = &snapshot_entry;
+        break;
       }
         }
+        if (!snapshot) {
+      return STATUS_FORMAT(
+          InternalError, "Response contained $0 entries but no entry for snapshot '$1'",
+          resp.snapshots_size(), snapshot_id);
+        }
+
+        if (FLAGS_TEST_metadata_file_format_version == -1) {
+      // Remove 'namespace_name' from SysTablesEntryPB.
+      SysSnapshotEntryPB& sys_entry = *snapshot->mutable_entry();
+      for (SysRowEntry& entry : *sys_entry.mutable_entries()) {
+        if (entry.type() == SysRowEntryType::TABLE) {
+          auto meta = VERIFY_RESULT(ParseFromSlice<SysTablesEntryPB>(entry.data()));
+          meta.clear_namespace_name();
+          entry.set_data(meta.SerializeAsString());
+        }
+      }
+        }
+  } else {
+        ExportSnapshotResponsePB resp;
+        RETURN_NOT_OK(RequestMasterLeader(&resp, [&](RpcController* rpc) {
+          ExportSnapshotRequestPB req;
+          req.set_snapshot_id(snapshot_id);
+          req.set_master_tablet_location(
+              master_tablet_location);  // The master tablet to export the snapshot from.
+          req.set_export_ht(read_time.ToUint64());
+          req.set_namespace_id(namespace_id);
+          return master_backup_proxy_->ExportSnapshot(req, &resp, rpc);
+        }));
+        snapshot = resp.release_snapshot();
   }
 
-  cout << "Exporting snapshot " << snapshot_id << " (" << snapshot->entry().state() << ") to file "
-       << file_name << endl;
+  if (snapshot) {
+        cout << "Exporting snapshot " << snapshot_id << " (" << snapshot->entry().state()
+             << ") to file " << output_file_name << endl;
 
-  // Serialize snapshot protobuf to given path.
-  RETURN_NOT_OK(pb_util::WritePBContainerToPath(
-      Env::Default(), file_name, *snapshot, pb_util::OVERWRITE, pb_util::SYNC));
+        // Serialize snapshot protobuf to given path.
+        RETURN_NOT_OK(pb_util::WritePBContainerToPath(
+            Env::Default(), output_file_name, *snapshot, pb_util::OVERWRITE, pb_util::SYNC));
 
-  cout << "Snapshot metadata was saved into file: " << file_name << endl;
+        cout << "Snapshot metadata was saved into file: " << output_file_name << endl;
+  }
   return Status::OK();
 }
 

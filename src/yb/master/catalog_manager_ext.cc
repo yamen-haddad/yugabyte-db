@@ -55,6 +55,7 @@
 #include "yb/consensus/consensus.h"
 
 #include "yb/docdb/consensus_frontier.h"
+#include "yb/docdb/doc_rowwise_iterator.h"
 #include "yb/docdb/doc_write_batch.h"
 #include "yb/docdb/docdb_pgapi.h"
 
@@ -88,6 +89,7 @@
 
 #include "yb/util/cast.h"
 #include "yb/util/date_time.h"
+#include "yb/util/file_util.h"
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
@@ -1270,6 +1272,99 @@ Status CatalogManager::ImportSnapshotMeta(const ImportSnapshotMetaRequestPB* req
       req->snapshot(), epoch, resp, &namespace_map, &type_map, &tables_data,
       rpc->GetClientDeadline()));
 
+  return Status::OK();
+}
+
+Status CatalogManager::ExportSnapshot(
+    const ExportSnapshotRequestPB* req, ExportSnapshotResponsePB* resp, rpc::RpcContext* rpc,
+    const LeaderEpoch& epoch) {
+  LOG(INFO) << "Servicing ExportSnapshot request: " << req->ShortDebugString();
+  auto dir = req->master_tablet_location();
+  auto read_time = HybridTime::FromPB(req->export_ht());
+  auto snapshot_id = req->snapshot_id();
+  auto namespace_id = req->namespace_id();
+  auto tablet = VERIFY_RESULT(tablet_peer()->shared_tablet_safe());
+  rocksdb::Options rocksdb_options;
+  tablet->InitRocksDBOptions(&rocksdb_options, " [TMP]: ");
+  auto db = VERIFY_RESULT(rocksdb::DB::Open(rocksdb_options, dir));
+  // db can't be closed concurrently, so it is ok to use dummy ScopedRWOperation.
+  auto db_pending_op = ScopedRWOperation();
+  auto doc_db = docdb::DocDB::FromRegularUnbounded(db.get());
+  const docdb::DocReadContext& doc_read_cntxt = doc_read_context();
+  dockv::ReaderProjection projection(doc_read_cntxt.schema());
+  docdb::DocRowwiseIterator namespace_iter = docdb::DocRowwiseIterator(
+      projection, doc_read_cntxt, TransactionOperationContext(), doc_db,
+      docdb::ReadOperationData::FromSingleReadTime(read_time), db_pending_op, nullptr);
+  SnapshotInfoPB* snapshot = resp->mutable_snapshot();
+  snapshot->set_id(snapshot_id);
+  // only set some fields in entry as the entries for namespace,tables,tablets are stored in
+  // backup_entries
+  auto sys_snapshot_entry = snapshot->mutable_entry();
+  sys_snapshot_entry->set_state(SysSnapshotEntryPB_State_COMPLETE);
+  sys_snapshot_entry->set_snapshot_hybrid_time(read_time.ToUint64());
+  sys_snapshot_entry->set_version(3);
+  snapshot->set_format_version(2);
+  // Pass 1: Get the SysSnapshotEntryPB of <snapshot_id> (mainly to get the sysNamespaceEntryPB)
+  // we might not need Pass 1 if the user will provide the namespace_id
+  // Pass 1 replacement: to get the SysNamespaceEntryPB of the selected database
+  RETURN_NOT_OK(EnumerateSysCatalog(
+      &namespace_iter, doc_read_cntxt.schema(), SysRowEntryType::NAMESPACE,
+      [&](const Slice& id, const Slice& data) -> Status {
+        auto pb = VERIFY_RESULT(pb_util::ParseFromSlice<SysNamespaceEntryPB>(data));
+        if (id.ToBuffer() == namespace_id) {
+          LOG(INFO) << "Found SysNamespaceEntryPB: " << pb.ShortDebugString();
+          BackupRowEntryPB* table_backup_entry = snapshot->add_backup_entries();
+          auto entry = table_backup_entry->mutable_entry();
+          entry->set_id(id.ToBuffer());
+          entry->set_type(SysRowEntryType::NAMESPACE);
+          entry->set_data(data.ToBuffer());
+        }
+        return Status::OK();
+      }));
+  // Pass 2: Get all the SysTablesEntry of the database that are in running state as of read_time
+  std::set<TableId> table_ids;
+  docdb::DocRowwiseIterator tables_iter = docdb::DocRowwiseIterator(
+      projection, doc_read_cntxt, TransactionOperationContext(), doc_db,
+      docdb::ReadOperationData::FromSingleReadTime(read_time), db_pending_op, nullptr);
+  RETURN_NOT_OK(EnumerateSysCatalog(
+      &tables_iter, doc_read_cntxt.schema(), SysRowEntryType::TABLE,
+      [&](const Slice& id, const Slice& data) -> Status {
+        auto pb = VERIFY_RESULT(pb_util::ParseFromSlice<SysTablesEntryPB>(data));
+        // google::protobuf::RepeatedField<BackupRowEntryPB>* backup_entries
+        if (pb.namespace_id() == namespace_id && pb.state() == SysTablesEntryPB::RUNNING &&
+            !pb.schema().table_properties().is_ysql_catalog_table()) {
+          LOG(INFO) << "Found SysTablesEntryPB: " << pb.ShortDebugString();
+          BackupRowEntryPB* table_backup_entry = snapshot->add_backup_entries();
+          auto entry = table_backup_entry->mutable_entry();
+          entry->set_id(id.ToBuffer());
+          entry->set_type(SysRowEntryType::TABLE);
+          entry->set_data(data.ToBuffer());
+          table_backup_entry->set_pg_schema_name(pb.schema().pgschema_name());
+          // TODO (YAMEN): Discuss the case of colocated tables (Adding the parent id to the set).
+          table_ids.insert(id.ToBuffer());
+        }
+        return Status::OK();
+      }));
+  // Pass 3 get all the SysTabletsEntry of the running tables that are in running state as of read
+  // time
+  docdb::DocRowwiseIterator tablets_iter = docdb::DocRowwiseIterator(
+      projection, doc_read_cntxt, TransactionOperationContext(), doc_db,
+      docdb::ReadOperationData::FromSingleReadTime(read_time), db_pending_op, nullptr);
+  RETURN_NOT_OK(EnumerateSysCatalog(
+      &tablets_iter, doc_read_cntxt.schema(), SysRowEntryType::TABLET,
+      [&](const Slice& id, const Slice& data) -> Status {
+        auto pb = VERIFY_RESULT(pb_util::ParseFromSlice<SysTabletsEntryPB>(data));
+        if (table_ids.find(pb.table_id()) != table_ids.end() &&
+            pb.state() == SysTabletsEntryPB::RUNNING) {
+          LOG(INFO) << "Found SysTabletsEntryPB is: " << pb.ShortDebugString();
+          BackupRowEntryPB* table_backup_entry = snapshot->add_backup_entries();
+          auto entry = table_backup_entry->mutable_entry();
+          entry->set_id(id.ToBuffer());
+          entry->set_type(SysRowEntryType::TABLET);
+          entry->set_data(data.ToBuffer());
+        }
+        return Status::OK();
+      }));
   return Status::OK();
 }
 
