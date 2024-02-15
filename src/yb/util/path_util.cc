@@ -147,4 +147,14 @@ Status CheckODirectTempFileCreationInDir(Env* env,
 #endif
   return Status::OK();
 }
+
+string path_utils::GetToolPath(const string& rel_path, const string& tool_name) {
+  string exe;
+  CHECK_OK(Env::Default()->GetExecutablePath(&exe));
+  const string binroot = JoinPathSegments(DirName(exe), rel_path);
+  const string tool_path = JoinPathSegments(binroot, tool_name);
+  CHECK(Env::Default()->FileExists(tool_path)) << tool_name << " tool not found at " << tool_path;
+  return tool_path;
+}
+
 } // namespace yb

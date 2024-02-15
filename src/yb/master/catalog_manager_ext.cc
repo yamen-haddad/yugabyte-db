@@ -16,6 +16,7 @@
 #include <set>
 #include <unordered_set>
 #include <google/protobuf/util/message_differencer.h>
+#include <boost/algorithm/string/replace.hpp>
 
 #include "yb/common/colocated_util.h"
 #include "yb/common/common_fwd.h"
@@ -24,6 +25,7 @@
 #include "yb/common/entity_ids.h"
 #include "yb/common/entity_ids_types.h"
 #include "yb/common/pg_system_attr.h"
+#include "yb/common/snapshot.h"
 #include "yb/qlexpr/ql_name.h"
 #include "yb/common/ql_type.h"
 #include "yb/common/ql_type_util.h"
@@ -31,6 +33,7 @@
 #include "yb/common/schema.h"
 
 #include "yb/master/catalog_entity_info.h"
+#include "yb/master/catalog_entity_info.pb.h"
 #include "yb/master/catalog_manager-internal.h"
 #include "yb/master/catalog_manager.h"
 #include "yb/master/xcluster_consumer_registry_service.h"
@@ -102,8 +105,10 @@
 #include "yb/util/tostring.h"
 #include "yb/util/string_util.h"
 #include "yb/util/trace.h"
+#include "yb/util/ysql_binary_runner.h"
 
 #include "yb/yql/cql/ql/util/statement_result.h"
+#include "yb/yql/pgwrapper/pg_wrapper.h"
 
 #include "ybgate/ybgate_api.h"
 
@@ -1302,6 +1307,44 @@ void CatalogManager::DeleteNewSnapshotObjects(const NamespaceMap& namespace_map,
     ProcessDeleteObjectStatus(
         "namespace", new_id, resp, DeleteNamespace(&req, &resp, nullptr, epoch));
   }
+}
+
+Status CatalogManager::ClonePgSchemaObjects(
+    const std::string& source_db_name, const std::string& clone_db_name,
+    const HybridTime& restore_time) {
+  std::string timestamp_flag =
+      "--read-time=" + std::to_string(restore_time.GetPhysicalValueMicros());
+  // Pick one of the live tservers to send ysql_dump and ysqlsh requests to.
+  auto ts = GetAllLiveNotBlacklistedTServers()[0];
+  auto ts_host = ts->GetRegistration().common().private_rpc_addresses()[0];
+  auto pg_port = ts->GetRegistration().common().has_pg_port()
+                     ? ts->GetRegistration().common().pg_port()
+                     : pgwrapper::PgProcessConf().kDefaultPort;
+  ts_host.set_port(pg_port);
+  // Run ysql_dump to generate the PG fdatabase schema
+  YsqlDumpRunner ysql_dump_runner(HostPort::FromPB(ts_host));
+  std::string dump_output =
+      VERIFY_RESULT(ysql_dump_runner.DumpSchemaAsOfTime(source_db_name, restore_time));
+  ysql_dump_runner.ModifyDBNameInScript(dump_output, clone_db_name);
+  // Write the modified dump output to a file in order to execute it using ysqlsh
+  unique_ptr<WritableFile> dump_output_file;
+  std::string tmp_file_name;
+  RETURN_NOT_OK(Env::Default()->NewTempWritableFile(
+      WritableFileOptions(), clone_db_name + "_ysql_dumpXXXXXX", &tmp_file_name,
+      &dump_output_file));
+  RETURN_NOT_OK(dump_output_file->Append(dump_output));
+  RETURN_NOT_OK(dump_output_file->Close());
+  auto scope_exit = ScopeExit([tmp_file_name] {
+    if (Env::Default()->FileExists(tmp_file_name)) {
+      WARN_NOT_OK(
+          Env::Default()->DeleteFile(tmp_file_name),
+          Format("Failed to delete ysql_dump_file $0 as a cloning cleanup.", tmp_file_name));
+    }
+  });
+  // Execute the sql script to generate the PG database
+  YsqlshRunner ysqlsh_runner(HostPort::FromPB(ts_host));
+  RETURN_NOT_OK(ysqlsh_runner.ExecuteSqlScript(tmp_file_name));
+  return Status::OK();
 }
 
 Status CatalogManager::ImportSnapshotMeta(const ImportSnapshotMetaRequestPB* req,

@@ -80,4 +80,18 @@ Status SetupRootDir(
 // environment variable.
 Status CheckODirectTempFileCreationInDir(Env* env, const std::string& dir_path);
 
+namespace path_utils {
+// Return the path of a yb-tool.
+std::string GetToolPath(const std::string& rel_path, const std::string& tool_name);
+
+inline std::string GetToolPath(const std::string& tool_name) {
+  return GetToolPath("../bin", tool_name);
+}
+
+inline std::string GetPgToolPath(const std::string& tool_name) {
+  std::string output = GetToolPath("../postgres/bin", tool_name);
+  return GetToolPath("../postgres/bin", tool_name);
+}
+
+}  // namespace path_utils
 } // namespace yb
