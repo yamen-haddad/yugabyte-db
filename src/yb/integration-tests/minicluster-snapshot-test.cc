@@ -355,8 +355,27 @@ TEST_F(MasterSnapshotTest, FailSysCatalogWriteWithStaleTable) {
   messenger->Shutdown();
 }
 
-class MasterExportSnapshotTest : public YBTest,
-                                 public ::testing::WithParamInterface<YsqlColocationConfig> {
+// Execute the provided sql query and return the result parsed into string
+Result<std::string> ExecuteSQLQueryAsstring(
+    pgwrapper::PGConn& conn, std::string query, int num_columns) {
+  auto results = VERIFY_RESULT(conn.Fetch(query));
+  std::stringstream result_string;
+  for (int i = 0; i < PQntuples(results.get()); ++i) {
+    if (i) {
+      result_string << "\n";
+    }
+    for (int col_num = 0; col_num < num_columns; col_num++) {
+      if (col_num != 0) {
+        result_string << ", ";
+      }
+      result_string << VERIFY_RESULT(pgwrapper::ToString(results.get(), i, col_num));
+    }
+  }
+  return result_string.str();
+}
+
+class PostgresMiniClusterTest : public YBTest,
+                                public ::testing::WithParamInterface<YsqlColocationConfig> {
  public:
   void SetUp() override {
     master::SetDefaultInitialSysCatalogSnapshotFlags();
@@ -372,7 +391,7 @@ class MasterExportSnapshotTest : public YBTest,
     ASSERT_OK(mini_cluster()->WaitForTabletServerCount(3));
     ASSERT_OK(WaitForInitDb(mini_cluster()));
     test_cluster_.client_ = ASSERT_RESULT(mini_cluster()->CreateClient());
-    ASSERT_OK(InitPostgres(&test_cluster_));
+    ASSERT_OK(test_cluster_.InitPostgres());
 
     LOG(INFO) << "Cluster created successfully";
   }
@@ -392,35 +411,12 @@ class MasterExportSnapshotTest : public YBTest,
     test_cluster_.client_.reset();
   }
 
-  Status InitPostgres(PostgresMiniCluster* cluster) {
-    auto pg_ts = RandomElement(cluster->mini_cluster_->mini_tablet_servers());
-    auto port = cluster->mini_cluster_->AllocateFreePort();
-    pgwrapper::PgProcessConf pg_process_conf =
-        VERIFY_RESULT(pgwrapper::PgProcessConf::CreateValidateAndRunInitDb(
-            AsString(Endpoint(pg_ts->bound_rpc_addr().address(), port)),
-            pg_ts->options()->fs_opts.data_paths.front() + "/pg_data",
-            pg_ts->server()->GetSharedMemoryFd()));
-    pg_process_conf.master_addresses = pg_ts->options()->master_addresses_flag;
-    pg_process_conf.force_disable_log_file = true;
-    ANNOTATE_UNPROTECTED_WRITE(FLAGS_pgsql_proxy_webserver_port) =
-        cluster->mini_cluster_->AllocateFreePort();
-
-    LOG(INFO) << "Starting PostgreSQL server listening on " << pg_process_conf.listen_addresses
-              << ":" << pg_process_conf.pg_port << ", data: " << pg_process_conf.data_dir
-              << ", pgsql webserver port: " << FLAGS_pgsql_proxy_webserver_port;
-    cluster->pg_supervisor_ =
-        std::make_unique<pgwrapper::PgSupervisor>(pg_process_conf, nullptr /* tserver */);
-    RETURN_NOT_OK(cluster->pg_supervisor_->Start());
-
-    cluster->pg_host_port_ = HostPort(pg_process_conf.listen_addresses, pg_process_conf.pg_port);
-    return Status::OK();
-  }
   MiniCluster* mini_cluster() { return test_cluster_.mini_cluster_.get(); }
 
   client::YBClient* client() { return test_cluster_.client_.get(); }
   Status CreateDatabase(
       PostgresMiniCluster* cluster, const std::string& namespace_name,
-      YsqlColocationConfig colocated) {
+      YsqlColocationConfig colocated = YsqlColocationConfig::kNotColocated) {
     auto conn = VERIFY_RESULT(cluster->Connect());
     RETURN_NOT_OK(conn.ExecuteFormat(
         "CREATE DATABASE $0$1", namespace_name,
@@ -440,6 +436,8 @@ class MasterExportSnapshotTest : public YBTest,
  protected:
   PostgresMiniCluster test_cluster_;
 };
+
+class MasterExportSnapshotTest : public PostgresMiniClusterTest {};
 
 INSTANTIATE_TEST_CASE_P(
     Colocation, MasterExportSnapshotTest,
@@ -496,6 +494,69 @@ TEST_P(MasterExportSnapshotTest, ExportSnapshotAsOfTime) {
   ASSERT_TRUE(pb_util::ArePBsEqual(
       std::move(ground_truth), std::move(snapshot_info_as_of_time), /* diff_str */ nullptr));
   messenger->Shutdown();
+}
+
+class YsqlCloneTest : public PostgresMiniClusterTest {};
+
+// Test cloning PG schema objects from source database to clone database.
+// 1. Create database "db1" and create some tables (t1,t2).
+// 2. Mark time t.
+// 3. Create one more table t3 and add column to t1.
+// 4. Clone the PG schema objects of db1 into a clone database db2 as of time t.
+// 5. Assert the schema of db2 is same as schema of DB1 at time t.
+TEST_F(YsqlCloneTest, ClonePgSchemaObjects) {
+  // 1.
+  auto source_namespace_name = "db1";
+  auto clone_namespace_name = "db2";
+  ASSERT_OK(CreateDatabase(&test_cluster_, source_namespace_name));
+  LOG(INFO) << Format("Database $0 has been created.", source_namespace_name);
+  auto conn = ASSERT_RESULT(test_cluster_.ConnectToDB(source_namespace_name));
+  LOG(INFO) << Format("Creating tables t1,t2");
+  ASSERT_OK(conn.Execute("CREATE TABLE t1 (key INT PRIMARY KEY, value INT)"));
+  ASSERT_OK(conn.Execute("CREATE TABLE t2 (key INT PRIMARY KEY, c1 TEXT, c2 TEXT)"));
+  // Get the column names and types of t1 and t2 to compare with the clone output.
+  std::string table_columns_query_holder =
+      "SELECT column_name, data_type"
+      " FROM information_schema.columns"
+      " WHERE table_schema = 'public' AND table_name = '$0'";
+  std::string num_user_tables_query_holder =
+      "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND "
+      "table_catalog = '$0'";
+  std::string t1_columns =
+      ASSERT_RESULT(ExecuteSQLQueryAsstring(conn, Format(table_columns_query_holder, "t1"), 2));
+  std::string t2_columns =
+      ASSERT_RESULT(ExecuteSQLQueryAsstring(conn, Format(table_columns_query_holder, "t2"), 2));
+  auto db1_num_tables = ASSERT_RESULT(
+      conn.FetchRow<int64_t>(Format(num_user_tables_query_holder, source_namespace_name)));
+  LOG(INFO) << "db1 schema details at clone time:";
+  LOG(INFO) << Format("table t1 colmns' names and type: $0", t1_columns);
+  LOG(INFO) << Format("table t2 colmns' names and type: $0", t2_columns);
+  LOG(INFO) << Format("num of tables of db1 is: $0", db1_num_tables);
+  // 2.
+  Timestamp time = ASSERT_RESULT(GetCurrentTime());
+  LOG(INFO) << Format("current timestamp is: {$0}", time);
+  // 3.
+  ASSERT_OK(conn.Execute("CREATE TABLE t3 (key INT PRIMARY KEY, c1 INT, c2 TEXT, c3 TEXT)"));
+  ASSERT_OK(conn.Execute("ALTER TABLE t1 ADD COLUMN new_col TEXT"));
+  // 4.
+  LOG(INFO) << Format(
+      "Cloning PG schema objects of database: $0 into database: $1", source_namespace_name,
+      clone_namespace_name);
+  ASSERT_OK(mini_cluster()->mini_master()->catalog_manager_impl().ClonePgSchemaObjects(
+      source_namespace_name, clone_namespace_name,
+      HybridTime::FromMicros(static_cast<uint64>(time.ToInt64())), test_cluster_.pg_host_port_));
+  // 5. verify that the two database has the same number of tables and that the two tables have the
+  // same columns' names and types
+  auto clone_db_conn = ASSERT_RESULT(test_cluster_.ConnectToDB(clone_namespace_name));
+  ASSERT_EQ(
+      db1_num_tables, ASSERT_RESULT(clone_db_conn.FetchRow<int64_t>(
+                          Format(num_user_tables_query_holder, clone_namespace_name))));
+  ASSERT_EQ(
+      t1_columns, ASSERT_RESULT(ExecuteSQLQueryAsstring(
+                      clone_db_conn, Format(table_columns_query_holder, "t1"), 2)));
+  ASSERT_EQ(
+      t2_columns, ASSERT_RESULT(ExecuteSQLQueryAsstring(
+                      clone_db_conn, Format(table_columns_query_holder, "t2"), 2)));
 }
 
 }  // namespace master

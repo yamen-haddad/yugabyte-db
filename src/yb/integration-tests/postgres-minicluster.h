@@ -29,6 +29,7 @@ class PostgresMiniCluster {
   std::unique_ptr<yb::pgwrapper::PgSupervisor> pg_supervisor_;
   HostPort pg_host_port_;
   boost::optional<client::TransactionManager> txn_mgr_;
+  Status InitPostgres();
   Result<pgwrapper::PGConn> Connect();
   Result<pgwrapper::PGConn> ConnectToDB(
       const std::string& dbname, bool simple_query_protocol = false);

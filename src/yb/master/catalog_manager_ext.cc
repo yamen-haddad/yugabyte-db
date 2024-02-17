@@ -1311,18 +1311,11 @@ void CatalogManager::DeleteNewSnapshotObjects(const NamespaceMap& namespace_map,
 
 Status CatalogManager::ClonePgSchemaObjects(
     const std::string& source_db_name, const std::string& clone_db_name,
-    const HybridTime& restore_time) {
+    const HybridTime& restore_time, HostPort pg_host_port) {
   std::string timestamp_flag =
       "--read-time=" + std::to_string(restore_time.GetPhysicalValueMicros());
-  // Pick one of the live tservers to send ysql_dump and ysqlsh requests to.
-  auto ts = GetAllLiveNotBlacklistedTServers()[0];
-  auto ts_host = ts->GetRegistration().common().private_rpc_addresses()[0];
-  auto pg_port = ts->GetRegistration().common().has_pg_port()
-                     ? ts->GetRegistration().common().pg_port()
-                     : pgwrapper::PgProcessConf().kDefaultPort;
-  ts_host.set_port(pg_port);
   // Run ysql_dump to generate the PG fdatabase schema
-  YsqlDumpRunner ysql_dump_runner(HostPort::FromPB(ts_host));
+  YsqlDumpRunner ysql_dump_runner(HostPort::FromPB(pg_host_port));
   std::string dump_output =
       VERIFY_RESULT(ysql_dump_runner.DumpSchemaAsOfTime(source_db_name, restore_time));
   ysql_dump_runner.ModifyDBNameInScript(dump_output, clone_db_name);
@@ -1342,7 +1335,7 @@ Status CatalogManager::ClonePgSchemaObjects(
     }
   });
   // Execute the sql script to generate the PG database
-  YsqlshRunner ysqlsh_runner(HostPort::FromPB(ts_host));
+  YsqlshRunner ysqlsh_runner(HostPort::FromPB(pg_host_port));
   RETURN_NOT_OK(ysqlsh_runner.ExecuteSqlScript(tmp_file_name));
   return Status::OK();
 }
