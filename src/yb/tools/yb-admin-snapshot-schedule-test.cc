@@ -5270,6 +5270,99 @@ TEST_F(YbAdminSnapshotScheduleFailoverTests, LeaderFailoverRestoreSnapshot) {
   ASSERT_EQ(rows, "1,before");
 }
 
+// Tests that if the master leader crashes while dropping a table (after marking the table as
+// HIDING), the table is marked as HIDDEN when the new leader reloads the sys.catalog. i.e ensure
+// that the table is never stuck in HIDING state.
+TEST_F(YbAdminSnapshotScheduleTest, DroppedTableMarkedHiddenAfterFailover) {
+  auto schedule_id = ASSERT_RESULT(PrepareQl(kRetention, kRetention + 1s));
+  auto session = client_->NewSession(60s);
+  LOG(INFO) << "Create table";
+  ASSERT_NO_FATALS(client::kv_table_test::CreateTable(
+      client::Transactional::kTrue, 3, client_.get(), &table_));
+  ASSERT_OK(cluster_->SetFlagOnMasters("TEST_simulate_crash_after_table_marked_deleting", "true"));
+  LOG(INFO) << "Delete table";
+  ASSERT_NOK(client_->DeleteTable(client::kTableName));
+  LOG(INFO) << "Stepping down the master leader";
+  ASSERT_OK(cluster_->StepDownMasterLeaderAndWaitForNewLeader());
+  MonoDelta timeout = 30s;
+  // Wait until the table is marked as hidden.
+  ASSERT_OK(Wait([&]() -> Result<bool> {
+    auto proxy = cluster_->GetLeaderMasterProxy<master::MasterDdlProxy>();
+    master::ListTablesRequestPB req;
+    master::ListTablesResponsePB resp;
+    rpc::RpcController controller;
+    controller.set_timeout(timeout);
+    req.set_include_not_running(true);
+    RETURN_NOT_OK(proxy.ListTables(req, &resp, &controller));
+    for (const auto& table : resp.tables()) {
+      if (table.table_type() != TableType::TRANSACTION_STATUS_TABLE_TYPE
+          && table.relation_type() != master::RelationType::SYSTEM_TABLE_RELATION
+          && !table.hidden()) {
+        LOG(INFO) << "Not yet hidden table: " << table.ShortDebugString();
+        return false;
+      }
+    }
+    return true;
+  }, CoarseMonoClock::now() + timeout, "Are Tables Hidden"));
+
+  // //old ysql test
+  // ASSERT_OK(PrepareCommon());
+  // ASSERT_OK(cluster_->SetFlagOnMasters("TEST_simulate_crash_after_table_marked_deleting", "true"));
+  // std::string db_name = "test_db_name";
+  // std::string table_name = "test_table";
+  // ASSERT_OK(ASSERT_RESULT(PgConnect()).ExecuteFormat("CREATE DATABASE $0", db_name));
+  // auto schedule_id = ASSERT_RESULT(
+  //     CreateSnapshotScheduleAndWaitSnapshot("ysql." + db_name, kInterval, kRetention));
+  // auto conn = ASSERT_RESULT(PgConnect(db_name));
+  // ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (key INT PRIMARY KEY, value INT)", table_name));
+  // LOG(INFO) << Format("Dropping table: $0", table_name);
+  // ASSERT_OK(conn.ExecuteFormat("DROP TABLE $0", table_name));
+  // LOG(INFO) << "Yamen: stepping down the master leader";
+  // ASSERT_OK(cluster_->StepDownMasterLeaderAndWaitForNewLeader());
+  // MonoDelta timeout = 30s;
+  // // Wait until the table is marked as hidden.
+  // ASSERT_OK(Wait([&]() -> Result<bool> {
+  //   auto proxy = cluster_->GetLeaderMasterProxy<master::MasterDdlProxy>();
+  //   master::ListTablesRequestPB req;
+  //   master::ListTablesResponsePB resp;
+  //   rpc::RpcController controller;
+  //   controller.set_timeout(timeout);
+  //   req.set_include_not_running(true);
+  //   RETURN_NOT_OK(proxy.ListTables(req, &resp, &controller));
+  //   for (const auto& table : resp.tables()) {
+  //     if (table.table_type() != TableType::TRANSACTION_STATUS_TABLE_TYPE
+  //         && table.relation_type() != master::RelationType::SYSTEM_TABLE_RELATION
+  //         && !table.hidden()) {
+  //       LOG(INFO) << "Not yet hidden table: " << table.ShortDebugString();
+  //       return false;
+  //     }
+  //   }
+  //   return true;
+  // }, CoarseMonoClock::now() + timeout, "Are Tables Hidden"));
+  // Maybe refactor that as a utility function allTabletsAreHidden
+  // // Check all the tablets are hidden.
+  // ASSERT_OK(WaitFor([this]() -> Result<bool> {
+  //   bool all_tablets_hidden = true;
+  //   for (size_t i = 0; i < cluster_->num_tablet_servers(); i++) {
+  //     auto proxy = cluster_->GetTServerProxy<tserver::TabletServerServiceProxy>(i);
+  //     tserver::ListTabletsRequestPB req;
+  //     tserver::ListTabletsResponsePB resp;
+  //     rpc::RpcController controller;
+  //     controller.set_timeout(30s);
+  //     RETURN_NOT_OK(proxy.ListTablets(req, &resp, &controller));
+  //     for (const auto& tablet : resp.status_and_schema()) {
+  //       if (tablet.tablet_status().namespace_name() == client::kTableName.namespace_name()) {
+  //         LOG(INFO) << "Tablet " << tablet.tablet_status().tablet_id() << " of table "
+  //                   << tablet.tablet_status().table_name() << ", hidden status "
+  //                   << tablet.tablet_status().is_hidden();
+  //         all_tablets_hidden = all_tablets_hidden && tablet.tablet_status().is_hidden();
+  //       }
+  //     }
+  //   }
+  //   return all_tablets_hidden;
+  // }, 30s, "Wait for all the tablets marking as hidden."));
+}
+
 class YbAdminSnapshotScheduleTestWithLB : public YbAdminSnapshotScheduleTest {
   std::vector<std::string> ExtraMasterFlags() override {
     std::vector<std::string> flags;

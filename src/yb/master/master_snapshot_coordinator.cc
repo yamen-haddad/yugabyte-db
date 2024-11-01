@@ -1001,7 +1001,8 @@ class MasterSnapshotCoordinator::Impl {
   }
 
   Result<std::vector<SnapshotScheduleId>> GetSnapshotSchedules(
-      SysRowEntryType type, const std::string& object_id) const {
+      SysRowEntryType type, const std::string& object_id,
+      IncludeHiddenTables includeHiddenTables = IncludeHiddenTables::kFalse) const {
     std::vector<std::pair<SnapshotScheduleId, SnapshotScheduleFilterPB>> schedules;
     {
       std::lock_guard lock(mutex_);
@@ -1014,7 +1015,7 @@ class MasterSnapshotCoordinator::Impl {
 
     std::vector<SnapshotScheduleId> result;
     for (const auto& [schedule_id, filter] : schedules) {
-      auto entries = VERIFY_RESULT(CollectEntries(filter));
+      auto entries = VERIFY_RESULT(CollectEntries(filter, includeHiddenTables));
       for (const auto& entry : entries.entries()) {
         if (entry.type() == type && entry.id() == object_id) {
           result.emplace_back(schedule_id);
@@ -1094,9 +1095,11 @@ class MasterSnapshotCoordinator::Impl {
   }
 
   Status PopulateDeleteRetainerInfoForTabletDrop(
-      const TabletInfo& tablet_info, TabletDeleteRetainerInfo& delete_retainer) const {
+      const TabletInfo& tablet_info, TabletDeleteRetainerInfo& delete_retainer,
+      bool includeHiddenTables) const {
     delete_retainer.snapshot_schedules =
-        VERIFY_RESULT(GetSnapshotSchedules(SysRowEntryType::TABLE, tablet_info.table()->id()));
+        VERIFY_RESULT(GetSnapshotSchedules(SysRowEntryType::TABLE, tablet_info.table()->id(),
+                                          IncludeHiddenTables(includeHiddenTables)));
 
     delete_retainer.active_snapshot = IsTabletCoveredBySnapshot(tablet_info.tablet_id());
 
@@ -1933,8 +1936,9 @@ class MasterSnapshotCoordinator::Impl {
     return Status::OK();
   }
 
-  Result<SysRowEntries> CollectEntries(const SnapshotScheduleFilterPB& filter) const {
-    return context_.CollectEntriesForSnapshot(filter.tables().tables());
+  Result<SysRowEntries> CollectEntries(const SnapshotScheduleFilterPB& filter,
+    IncludeHiddenTables includeHiddenTables = IncludeHiddenTables::kFalse) const {
+    return context_.CollectEntriesForSnapshot(filter.tables().tables(), includeHiddenTables);
   }
 
   Status ForwardRestoreCheck(
@@ -2381,7 +2385,7 @@ Result<SnapshotSchedulesToObjectIdsMap>
 }
 
 Result<std::vector<SnapshotScheduleId>> MasterSnapshotCoordinator::GetSnapshotSchedules(
-    SysRowEntryType type, const std::string& object_id) {
+    SysRowEntryType type, const std::string& object_id, bool includeHiddenTables) {
   return impl_->GetSnapshotSchedules(type, object_id);
 }
 
@@ -2433,8 +2437,8 @@ Status MasterSnapshotCoordinator::PopulateDeleteRetainerInfoForTableDrop(
 }
 
 Status MasterSnapshotCoordinator::PopulateDeleteRetainerInfoForTabletDrop(
-    const TabletInfo& tablet_info, TabletDeleteRetainerInfo& delete_retainer) const {
-  return impl_->PopulateDeleteRetainerInfoForTabletDrop(tablet_info, delete_retainer);
+    const TabletInfo& tablet_info, TabletDeleteRetainerInfo& delete_retainer, bool includeHiddenTables) const {
+  return impl_->PopulateDeleteRetainerInfoForTabletDrop(tablet_info, delete_retainer, includeHiddenTables);
 }
 
 bool MasterSnapshotCoordinator::ShouldRetainHiddenTablet(

@@ -257,8 +257,9 @@ Status TabletLoader::Visit(const TabletId& tablet_id, const SysTabletsEntryPB& m
       catalog_manager_->deleted_tablets_loaded_from_sys_catalog_.insert(tablet_id);
     }
 
-    // Assume we need to delete this tablet until we find an active table using this tablet.
+    // Assume we need to delete/hide this tablet until we find an active table using this tablet.
     bool should_delete_tablet = !tablet_deleted;
+    bool should_hide_tablet = !tablet_deleted;
 
     for (const auto& table_id : table_ids) {
       TableInfoPtr table = catalog_manager_->tables_->FindTableOrNull(table_id);
@@ -304,6 +305,10 @@ Status TabletLoader::Visit(const TabletId& tablet_id, const SysTabletsEntryPB& m
         should_delete_tablet = false;
       }
 
+      if(!tl->is_hiding()){
+        should_hide_tablet = false;
+      }
+
       auto schema = tl->schema();
       ColocationId colocation_id = kColocationIdNotSet;
       bool is_colocated = true;
@@ -345,6 +350,17 @@ Status TabletLoader::Visit(const TabletId& tablet_id, const SysTabletsEntryPB& m
       l.mutable_data()->set_state(SysTabletsEntryPB::DELETED, deletion_msg);
       needs_async_write_to_sys_catalog = true;
       catalog_manager_->deleted_tablets_loaded_from_sys_catalog_.insert(tablet_id);
+    }
+
+    if (should_hide_tablet) {
+      LOG(INFO) << Format("Will mark tablet $0 for table $1 as HIDDEN post loading sys.catalog"
+      , tablet->id(), first_table->ToString());
+      // Each tablet will have a different hide_hybrid_time. However, all of them will be earlier
+      // than the time we set the hide_hybrid_time of the table. 
+      state_->AddPostLoadTask(
+        std::bind(&CatalogManager::MarkTabletAsHiddenPostReload, catalog_manager_, tablet->id())
+      ,Format("Marking tablet:$0 as HIDDEN post sys.catalog reload",tablet->id()));
+      listed_as_hidden = true;
     }
 
     l.Commit();

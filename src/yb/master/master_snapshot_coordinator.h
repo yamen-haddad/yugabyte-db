@@ -173,7 +173,7 @@ class MasterSnapshotCoordinator : public tablet::SnapshotCoordinator {
       SysRowEntryType type);
 
   Result<std::vector<SnapshotScheduleId>> GetSnapshotSchedules(
-      SysRowEntryType type, const std::string& object_id);
+      SysRowEntryType type, const std::string& object_id, bool includeHiddenTables = false);
 
   // Returns the id of a completed snapshot suitable for restoring to the given restore time.
   Result<TxnSnapshotId> GetSuitableSnapshotForRestore(
@@ -203,7 +203,7 @@ class MasterSnapshotCoordinator : public tablet::SnapshotCoordinator {
       const SnapshotSchedulesToObjectIdsMap& schedules_to_tables_map,
       TabletDeleteRetainerInfo& delete_retainer) const;
   Status PopulateDeleteRetainerInfoForTabletDrop(
-      const TabletInfo& tablet_info, TabletDeleteRetainerInfo& delete_retainer) const;
+      const TabletInfo& tablet_info, TabletDeleteRetainerInfo& delete_retainer, bool includeHiddenTables = false) const;
 
   bool ShouldRetainHiddenTablet(
       const TabletInfo& tablet_info,

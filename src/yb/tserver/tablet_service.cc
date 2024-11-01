@@ -1682,6 +1682,7 @@ void TabletServiceAdminImpl::DeleteTablet(const DeleteTabletRequestPB* req,
                                           DeleteTabletResponsePB* resp,
                                           rpc::RpcContext context) {
   if (PREDICT_FALSE(FLAGS_TEST_rpc_delete_tablet_fail)) {
+    LOG(INFO) << Format("Yamen: TabletServiceAdminImpl::DeleteTablet and returning error as FLAGS_TEST_rpc_delete_tablet_fail is set to ture");
     context.RespondFailure(STATUS(NetworkError, "Simulating network partition for test"));
     return;
   }

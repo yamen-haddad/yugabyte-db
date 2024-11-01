@@ -369,6 +369,10 @@ DEFINE_test_flag(bool, hang_on_namespace_transition, false,
 DEFINE_test_flag(bool, simulate_crash_after_table_marked_deleting, false,
     "Crash yb-master after table's state is set to DELETING. This skips tablets deletion.");
 
+DEFINE_test_flag(bool, simulate_crash_after_tablet_marked_deleted, false,
+    "Crash yb-master after tablet's state is set to DELETED. This skips sending AsyncDeleteReplica"
+    "requests to tserver.");
+
 DEPRECATE_FLAG(bool, master_drop_table_after_task_response, "11_2022");
 
 DEFINE_test_flag(bool, tablegroup_master_only, false,
@@ -3156,7 +3160,7 @@ Status CatalogManager::XReplValidateSplitCandidateTableUnlocked(const TableId& t
   RETURN_NOT_OK(xcluster_manager_->ValidateSplitCandidateTable(table_id));
 
   // Check if this table is part of a cdcsdk stream.
-  if (!FLAGS_enable_tablet_split_of_cdcsdk_streamed_tables && IsTablePartOfCDCSDK(table_id)) {
+  if (!FLAGS_enable_tablet_split_of_cdcsdk_streamed_tables && IsTablePartOfCDCSDKUnlocked(table_id)) {
     return STATUS_FORMAT(
         NotSupported,
         "Tablet splitting is not supported for tables that are a part of"
@@ -3797,7 +3801,7 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
     // Fail rewrites on tables that are part of CDC or XCluster replication, except for
     // TRUNCATEs on CDC tables when FLAGS_enable_truncate_cdcsdk_table is enabled.
     if (xcluster_manager_->IsTableReplicated(table_id) ||
-        (IsTablePartOfCDCSDK(table_id) &&
+        (IsTablePartOfCDCSDKUnlocked(table_id) &&
          (!orig_req->is_truncate() || !FLAGS_enable_truncate_cdcsdk_table))) {
       return STATUS(
           NotSupported,
@@ -5822,7 +5826,7 @@ Status CatalogManager::TruncateTable(const TableId& table_id,
   {
     SharedLock lock(mutex_);
     SCHECK_EC_FORMAT(
-        FLAGS_enable_truncate_cdcsdk_table || !IsTablePartOfCDCSDK(table_id), NotSupported,
+        FLAGS_enable_truncate_cdcsdk_table || !IsTablePartOfCDCSDKUnlocked(table_id), NotSupported,
         MasterError(MasterErrorPB::INVALID_REQUEST),
         "Cannot truncate a table $0 that has a CDCSDK Stream", table_id);
   }
@@ -10635,6 +10639,10 @@ Status CatalogManager::DeleteOrHideTabletsAndSendRequests(
     tablet_data.lock.Commit();
   }
 
+  if(FLAGS_TEST_simulate_crash_after_tablet_marked_deleted){
+    return Status::OK();
+  }
+
   for (auto& tablet_data : tablets_data) {
     auto& tablet = tablet_data.tablet;
     if (tablet_data.transaction_status_tablet) {
@@ -12332,7 +12340,7 @@ Status CatalogManager::CollectTable(
     std::vector<TableDescription>* all_tables,
     std::unordered_set<TableId>* parent_colocated_table_ids) {
   auto lock = table_description.table_info->LockForRead();
-  if (lock->started_hiding()) {
+  if (!flags.Test(CollectFlag::kIncludeHiddenTables) && lock->started_hiding()) {
     VLOG_WITH_PREFIX_AND_FUNC(4)
         << "Rejected hidden table: " << AsString(table_description.table_info);
     return Status::OK();
@@ -13180,10 +13188,10 @@ void CatalogManager::RefreshPgCatalogVersionInfoPeriodically() {
 }
 
 Result<TabletDeleteRetainerInfo> CatalogManager::GetDeleteRetainerInfoForTabletDrop(
-    const TabletInfo& tablet_info) {
+    const TabletInfo& tablet_info, bool includeHiddenTables) {
   TabletDeleteRetainerInfo retainer;
   RETURN_NOT_OK(master_->snapshot_coordinator().PopulateDeleteRetainerInfoForTabletDrop(
-      tablet_info, retainer));
+      tablet_info, retainer, includeHiddenTables));
 
   xcluster_manager_->PopulateTabletDeleteRetainerInfoForTabletDrop(tablet_info, retainer);
 
@@ -13207,6 +13215,23 @@ Result<TabletDeleteRetainerInfo> CatalogManager::GetDeleteRetainerInfoForTableDr
   // xCluster and CDCSDK do not retain dropped tables.
 
   return retainer;
+}
+
+void CatalogManager::MarkTabletAsHiddenPostReload(TabletId tablet_id) {
+  auto tablet = GetTabletInfo(tablet_id);
+  if(!tablet.ok()){
+    WARN_NOT_OK(tablet.status(),Format("Tablet: $0 not found", tablet_id));
+    return;
+  }
+  const auto delete_retainer = GetDeleteRetainerInfoForTabletDrop(**tablet, true/*includeHiddenTables */);
+  if(!delete_retainer.ok()){
+    WARN_NOT_OK(delete_retainer.status(),Format("Unable to get the delete retainer for tablet: $0", tablet_id));
+    return;
+  }
+  auto l = (*tablet)->LockForWrite();
+  MarkTabletAsHidden(l.mutable_data()->pb,Clock()->Now(),*delete_retainer);
+  l.Commit();
+  WriteTabletToSysCatalog(tablet_id);
 }
 
 void CatalogManager::MarkTabletAsHidden(

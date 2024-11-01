@@ -3093,7 +3093,7 @@ Status CatalogManager::IsObjectPartOfXRepl(
   SharedLock lock(mutex_);
   resp->set_is_object_part_of_xrepl(
       xcluster_manager_->IsTableReplicated(table_info->id()) ||
-      IsTablePartOfCDCSDK(table_info->id()));
+      IsTablePartOfCDCSDKUnlocked(table_info->id()));
   return Status::OK();
 }
 
@@ -4401,10 +4401,15 @@ Status CatalogManager::TEST_CDCSDKFailCreateStreamRequestIfNeeded(const std::str
 }
 
 bool CatalogManager::IsTablePartOfXRepl(const TableId& table_id) const {
-  return xcluster_manager_->IsTableReplicated(table_id) || IsTablePartOfCDCSDK(table_id);
+  return xcluster_manager_->IsTableReplicated(table_id) || IsTablePartOfCDCSDKUnlocked(table_id);
 }
 
 bool CatalogManager::IsTablePartOfCDCSDK(const TableId& table_id) const {
+  SharedLock lock(mutex_);
+  return IsTablePartOfCDCSDKUnlocked(table_id);
+}
+
+bool CatalogManager::IsTablePartOfCDCSDKUnlocked(const TableId& table_id) const {
   DCHECK(xrepl_maps_loaded_);
   auto* stream_ids = FindOrNull(cdcsdk_tables_to_stream_map_, table_id);
   if (stream_ids) {
@@ -4956,7 +4961,7 @@ void CatalogManager::CDCSDKPopulateDeleteRetainerInfoForTabletDrop(
       return;
     }
   }
-  delete_retainer.active_cdcsdk = IsTablePartOfCDCSDK(tablet_info.table()->id());
+  delete_retainer.active_cdcsdk = IsTablePartOfCDCSDKUnlocked(tablet_info.table()->id());
 }
 
 Status CatalogManager::UpdateCheckpointForTabletEntriesInCDCState(

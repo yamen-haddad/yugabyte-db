@@ -2187,7 +2187,8 @@ class CatalogManager : public tserver::TabletPeerLookupIf,
   // Is this table part of xCluster or CDCSDK?
   bool IsTablePartOfXRepl(const TableId& table_id) const REQUIRES_SHARED(mutex_);
 
-  bool IsTablePartOfCDCSDK(const TableId& table_id) const REQUIRES_SHARED(mutex_);
+  bool IsTablePartOfCDCSDK(const TableId& table_id) const EXCLUDES(mutex_);
+  bool IsTablePartOfCDCSDKUnlocked(const TableId& table_id) const REQUIRES_SHARED(mutex_);
 
   bool IsPitrActive();
 
@@ -2694,7 +2695,7 @@ class CatalogManager : public tserver::TabletPeerLookupIf,
       const google::protobuf::RepeatedPtrField<TableIdentifierPB>& tables, CollectFlags flags);
 
   Result<SysRowEntries> CollectEntriesForSnapshot(
-      const google::protobuf::RepeatedPtrField<TableIdentifierPB>& tables) override;
+      const google::protobuf::RepeatedPtrField<TableIdentifierPB>& tables, IncludeHiddenTables includeHiddenTables = IncludeHiddenTables::kFalse) override;
 
   server::Clock* Clock() override;
 
@@ -2942,12 +2943,13 @@ class CatalogManager : public tserver::TabletPeerLookupIf,
   // ShouldRetainHiddenTablet control the workflow of hiding tablets on drop and eventually deleting
   // them.
   // Any manager that needs to retain deleted tablets as hidden must hook into these methods.
-  Result<TabletDeleteRetainerInfo> GetDeleteRetainerInfoForTabletDrop(const TabletInfo& tablet_info)
+  Result<TabletDeleteRetainerInfo> GetDeleteRetainerInfoForTabletDrop(const TabletInfo& tablet_info, bool includeHiddenTables = false)
       EXCLUDES(mutex_);
   Result<TabletDeleteRetainerInfo> GetDeleteRetainerInfoForTableDrop(
       const TableInfo& table_info, const SnapshotSchedulesToObjectIdsMap& schedules_to_tables_map)
       EXCLUDES(mutex_);
 
+  void MarkTabletAsHiddenPostReload(TabletId tablet);
   void MarkTabletAsHidden(
       SysTabletsEntryPB& tablet_pb, const HybridTime& hide_ht,
       const TabletDeleteRetainerInfo& delete_retainer) const;
