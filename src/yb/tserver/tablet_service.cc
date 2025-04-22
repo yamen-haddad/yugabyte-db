@@ -237,6 +237,10 @@ DECLARE_bool(ysql_yb_disable_wait_for_backends_catalog_version);
 DEFINE_test_flag(
     string, mini_cluster_pg_host_port, "", "The PG host:port used in PostgresMiniclusterTest");
 
+DEFINE_test_flag(
+    int32, clone_pg_schema_inject_latency_ms, 0,
+    "Number of milliseconds the clone state manager will sleep in CloneNamespace.");
+
 DEFINE_test_flag(bool, fail_alter_schema_after_abort_transactions, false,
     "If true, setup an error status in AlterSchema and respond success to rpc call. "
     "This failure should not cause the TServer to crash but "
@@ -2186,8 +2190,9 @@ void TabletServiceAdminImpl::ClonePgSchema(
 
 Status TabletServiceAdminImpl::DoClonePgSchema(
     const ClonePgSchemaRequestPB* req, ClonePgSchemaResponsePB* resp) {
-  // Run ysql_dump to generate the schema of the clone database as of restore time.
-  const std::string& target_db_name = req->target_db_name();
+  AtomicFlagSleepMs(&FLAGS_TEST_clone_pg_schema_inject_latency_ms);
+      // Run ysql_dump to generate the schema of the clone database as of restore time.
+      const std::string& target_db_name = req->target_db_name();
 
   auto local_hostport = VERIFY_RESULT(GetLocalPgHostPort());
   YsqlDumpRunner ysql_dump_runner =
@@ -2199,7 +2204,8 @@ Status TabletServiceAdminImpl::DoClonePgSchema(
 
   // Execute the sql script to generate the PG database.
   YsqlshRunner ysqlsh_runner = VERIFY_RESULT(YsqlshRunner::GetYsqlshRunner(local_hostport));
-  RETURN_NOT_OK(ysqlsh_runner.ExecuteSqlScript(dump_output, "ysql_dump" /* tmp_file_prefix */));
+  RETURN_NOT_OK(
+      ysqlsh_runner.ExecuteSqlScript(dump_output, "clone_pg_schema" /* tmp_file_prefix */));
   LOG(INFO) << Format(
       "Clone Pg Schema Objects for source database: $0 to clone database: $1 done successfully",
       req->source_db_name(), target_db_name);

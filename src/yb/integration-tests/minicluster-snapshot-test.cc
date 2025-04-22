@@ -90,10 +90,12 @@ DECLARE_int32(metrics_snapshotter_interval_ms);
 DECLARE_int32(pgsql_proxy_webserver_port);
 DECLARE_uint64(snapshot_coordinator_poll_interval_ms);
 DECLARE_int32(tserver_heartbeat_metrics_interval_ms);
+DECLARE_int32(yb_client_admin_operation_timeout_sec);
 DECLARE_string(ysql_hba_conf_csv);
 DECLARE_int32(ysql_sequence_cache_minval);
 DECLARE_int32(ysql_clone_pg_schema_rpc_timeout_ms);
 DECLARE_int32(ysql_tablespace_info_refresh_secs);
+DECLARE_int32(TEST_clone_pg_schema_inject_latency_ms);
 DECLARE_bool(TEST_fail_clone_pg_schema);
 DECLARE_bool(TEST_fail_clone_tablets);
 DECLARE_string(TEST_mini_cluster_pg_host_port);
@@ -875,6 +877,16 @@ TEST_P(PgCloneTestWithColocatedDBParam, YB_DISABLE_TEST_IN_SANITIZERS(CloneWithA
   auto rows = ASSERT_RESULT((target_conn.FetchRows<int32_t, int32_t>("SELECT * FROM t1")));
   ASSERT_EQ(rows.size(), 1);
   ASSERT_EQ(rows[0], kRow);
+}
+
+TEST_F(PgCloneTest, CloneYsqlDbTiemout) {
+  // Inject an artificial delay that would make CREATE DATABASE timeout in case clone is using
+  // a timeout other than ysql_clone_pg_schema_rpc_timeout_ms.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_clone_pg_schema_inject_latency_ms) =
+      FLAGS_yb_client_admin_operation_timeout_sec * 1000;
+  auto status = source_conn_->ExecuteFormat(
+      "CREATE DATABASE $0 TEMPLATE $1", kTargetNamespaceName1, kSourceNamespaceName);
+  ASSERT_OK(status);
 }
 
 TEST_F(PgCloneTest, YB_DISABLE_TEST_IN_SANITIZERS(AbortMessage)) {
