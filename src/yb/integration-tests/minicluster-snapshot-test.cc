@@ -69,6 +69,9 @@
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/proxy.h"
 #include "yb/rpc/rpc_context.h"
+#include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_peer.h"
+#include "yb/tablet/transaction_coordinator.h"
 
 #include "yb/tools/admin-test-base.h"
 
@@ -78,6 +81,7 @@
 #include "yb/tserver/ts_tablet_manager.h"
 
 #include "yb/util/backoff_waiter.h"
+#include "yb/util/logging_test_util.h"
 #include "yb/util/status_format.h"
 
 #include "yb/util/sync_point.h"
@@ -122,6 +126,10 @@ DECLARE_bool(ysql_enable_concurrent_ddl);
 DECLARE_bool(ysql_yb_ddl_transaction_block_enabled);
 DECLARE_bool(yb_enable_read_committed_isolation);
 DECLARE_bool(ysql_enable_write_pipelining);
+DECLARE_bool(TEST_disable_apply_committed_transactions);
+DECLARE_uint64(transaction_resend_applying_interval_usec);
+DECLARE_uint32(ysql_stale_catalog_version_min_seconds);
+DECLARE_uint32(ysql_stale_catalog_version_random_extra_seconds);
 
 namespace yb {
 namespace tserver {
@@ -2259,6 +2267,112 @@ TEST_F(SysCatalogRestoreWithWritePipeliningTest, YB_DEBUG_ONLY_TEST(DdlTransacti
   auto table2_exists =
       ASSERT_RESULT(source_conn_->FetchRow<bool>("SELECT to_regclass('table2') IS NOT NULL"));
   ASSERT_FALSE(table2_exists) << "table2 from the aborted transaction unexpectedly persisted";
+}
+
+// Regression test for GH #34074 / DB-23682.
+//
+// The sys catalog tablet is shared by every YSQL database, but a PITR restore scoped to one
+// database resets transaction state for the whole tablet: the RESTORE_SYS_CATALOG apply closes and
+// reopens RocksDB, TransactionParticipant::SetDB drops every in-flight transaction without
+// reloading it from the intents DB, and RestoreSysCatalogReplicated then fences all transactions
+// started before the restore. A DDL on another database that already committed at its status
+// tablet, but whose APPLYING had not reached the sys catalog tablet yet, is later acknowledged as
+// applied without its intents ever being applied. The client was told the DDL succeeded.
+//
+// The test reproduces the field sequence deterministically: hold back APPLYING at the coordinators
+// (TEST_disable_apply_committed_transactions), commit a DDL on database B, restore database A, then
+// release the hold and check that database B still has the DDL.
+class SysCatalogRestoreOtherDbDdlTest : public PgCloneInitiallyEmptyDBTest {
+ protected:
+  void SetUp() override {
+    // Re-send a held-back APPLYING quickly once the hold is released.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_transaction_resend_applying_interval_usec) = 500 * 1000;
+    // With the bug, the DDL's tserver keeps a catalog version the master never confirms and the
+    // staleness detector would FATAL the in-process tserver. Keep it out of the way so the test
+    // fails on its own assertions instead.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_stale_catalog_version_min_seconds) = 3600;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_stale_catalog_version_random_extra_seconds) = 0;
+    PgCloneInitiallyEmptyDBTest::SetUp();
+  }
+
+  // Transactions still tracked by any transaction coordinator in the cluster.
+  size_t CountCoordinatorTransactions() {
+    size_t count = 0;
+    for (const auto& peer :
+         ListTabletPeers(cluster_.get(), ListPeersFilter::kAll, UserTabletsOnly::kFalse)) {
+      auto tablet = peer->shared_tablet_maybe_null();
+      if (!tablet) {
+        continue;
+      }
+      if (auto* coordinator = tablet->transaction_coordinator()) {
+        count += coordinator->test_count_transactions();
+      }
+    }
+    return count;
+  }
+
+  Status WaitForCoordinatorsIdle(const std::string& description) {
+    return WaitFor(
+        [this]() -> Result<bool> { return CountCoordinatorTransactions() == 0; }, kTimeout,
+        description);
+  }
+};
+
+TEST_F(SysCatalogRestoreOtherDbDdlTest, CommittedDdlOnOtherDbSurvivesRestore) {
+  // A second database that is NOT covered by the snapshot schedule on kSourceNamespaceName.
+  const std::string kOtherDb = "otherdb";
+  const std::string kSchema = "committed_before_restore";
+  ASSERT_OK(CreateDatabase(kOtherDb));
+  auto other_conn = ASSERT_RESULT(ConnectToDB(kOtherDb));
+
+  // Warm-up DDL, so the tserver already tracks kOtherDb's catalog version and invalidation
+  // messages (delivered by heartbeat) and the DDL under test takes the same path as in the field.
+  ASSERT_OK(other_conn.Execute("CREATE SCHEMA warmup"));
+  ASSERT_OK(WaitForCoordinatorsIdle("Warm-up DDL applied"));
+  const auto other_db_oid = ASSERT_RESULT(other_conn.FetchRow<int64_t>(
+      Format("SELECT oid::int8 FROM pg_database WHERE datname = '$0'", kOtherDb)));
+  const auto version_query = Format(
+      "SELECT current_version FROM pg_yb_catalog_version WHERE db_oid = $0", other_db_oid);
+  const auto version_before = ASSERT_RESULT(other_conn.FetchRow<int64_t>(version_query));
+
+  // Restore point for kSourceNamespaceName, taken before the DDL under test.
+  auto restore_time = ASSERT_RESULT(GetCurrentTime());
+  auto restore_ht = ASSERT_RESULT(HybridTime::ParseHybridTime(restore_time.ToString()));
+
+  // Hold back APPLYING at every coordinator. The DDL still commits at its status tablet and
+  // returns success, but its intents on the sys catalog tablet stay unapplied. This is the state
+  // the DDL was in when the restore arrived in the field.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_disable_apply_committed_transactions) = true;
+  ASSERT_OK(other_conn.ExecuteFormat("CREATE SCHEMA $0", kSchema));
+  // Committed from the coordinator's point of view: a new session sees it, because reads resolve
+  // the pending intents through the status tablet.
+  {
+    auto conn = ASSERT_RESULT(ConnectToDB(kOtherDb));
+    ASSERT_TRUE(ASSERT_RESULT(conn.FetchRow<bool>(
+        Format("SELECT to_regnamespace('$0') IS NOT NULL", kSchema))));
+  }
+
+  // Restore the OTHER database while the DDL's apply is still outstanding, so RESTORE_SYS_CATALOG
+  // is applied on the shared sys catalog tablet before any APPLYING for the DDL reaches it.
+  StringWaiterLogSink unknown_txn_log("Apply of unknown transaction");
+  auto restoration_id = ASSERT_RESULT(
+      RestoreSnapshotSchedule(master_backup_proxy_.get(), schedule_id_, restore_ht, kTimeout));
+  ASSERT_OK(WaitForRestoration(master_backup_proxy_.get(), restoration_id, kTimeout));
+
+  // Release the hold: the coordinator re-sends APPLYING for the committed DDL and finishes it.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_disable_apply_committed_transactions) = false;
+  ASSERT_OK(WaitForCoordinatorsIdle("Coordinator finished the DDL transaction"));
+
+  // The DDL was acknowledged as committed, so it must survive a restore of a different database.
+  auto conn = ASSERT_RESULT(ConnectToDB(kOtherDb));
+  EXPECT_TRUE(ASSERT_RESULT(conn.FetchRow<bool>(
+      Format("SELECT to_regnamespace('$0') IS NOT NULL", kSchema))))
+      << "committed DDL on " << kOtherDb << " was dropped by the PITR restore of "
+      << kSourceNamespaceName;
+  EXPECT_EQ(ASSERT_RESULT(conn.FetchRow<int64_t>(version_query)), version_before + 1)
+      << "catalog version increment of " << kOtherDb << " was lost";
+  EXPECT_FALSE(unknown_txn_log.IsEventOccurred())
+      << "sys catalog participant acknowledged the apply of a transaction it no longer knows";
 }
 
 }  // namespace master
