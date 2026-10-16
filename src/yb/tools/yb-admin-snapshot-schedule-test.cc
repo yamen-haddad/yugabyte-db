@@ -1679,6 +1679,55 @@ TEST_P(YbAdminSnapshotScheduleTestWithYsqlColocationRestoreParam, PgsqlDropTable
   RunTestWithColocatedParam(schedule_id);
 }
 
+// DROP COLUMN adds the column id to the tablet's deleted columns. Compaction past the history
+// cutoff discards non-packed values of deleted columns. Check that a column brought back by PITR,
+// and a column that reuses the id of a column dropped after the restore time, keep their values.
+TEST_P(YbAdminSnapshotScheduleTestWithYsqlColocationParam, PgsqlRestoreDroppedColumnCompaction) {
+  auto schedule_id = ASSERT_RESULT(PreparePgWithColocatedParam());
+  auto conn = ASSERT_RESULT(PgConnect(client::kTableName.namespace_name()));
+
+  ExecBeforeRestoreTS = [&conn](const std::string& prefix, const std::string& option) {
+    const auto table_name = prefix + "_table";
+    ASSERT_OK(conn.ExecuteFormat(
+        "CREATE TABLE $0 (key INT PRIMARY KEY, value TEXT, other INT) $1", table_name, option));
+    ASSERT_OK(conn.ExecuteFormat(
+        "INSERT INTO $0 SELECT i, 'insert_' || i, i FROM generate_series(1, 3) i", table_name));
+    // UPDATE writes the new value as a separate column entry, outside the packed row.
+    ASSERT_OK(conn.ExecuteFormat(
+        "UPDATE $0 SET value = 'update_' || key WHERE key <= 2", table_name));
+  };
+
+  ExecAfterRestoreTS = [&conn](const std::string& prefix, const std::string& option) {
+    const auto table_name = prefix + "_table";
+    ASSERT_OK(conn.ExecuteFormat("ALTER TABLE $0 DROP COLUMN value", table_name));
+    ASSERT_OK(conn.ExecuteFormat("ALTER TABLE $0 ADD COLUMN added TEXT", table_name));
+    ASSERT_OK(conn.ExecuteFormat("ALTER TABLE $0 DROP COLUMN added", table_name));
+  };
+
+  CheckAfterPITR = [this, &conn](const std::string& prefix, const std::string& option) {
+    const auto table_name = prefix + "_table";
+    // The restore rolls back the table's next column id, so this column gets the id of the
+    // column that was added and dropped after the restore time.
+    ASSERT_OK(conn.ExecuteFormat("ALTER TABLE $0 ADD COLUMN readded TEXT", table_name));
+    ASSERT_OK(conn.ExecuteFormat("UPDATE $0 SET readded = 'readded_' || key", table_name));
+
+    // Let the history cutoff pass the drops, then compact.
+    SleepFor(1s * (HistoryRetentionIntervalSec() + 2));
+    ASSERT_OK(CompactTablets(cluster_.get(), 300s * kTimeMultiplier));
+
+    using Row = std::tuple<int32_t, std::optional<std::string>, std::optional<std::string>>;
+    auto rows = ASSERT_RESULT((conn.FetchRows<int32_t, std::optional<std::string>,
+                                              std::optional<std::string>>(Format(
+        "SELECT key, value, readded FROM $0 ORDER BY key", table_name))));
+    ASSERT_EQ(rows, (std::vector<Row>{
+        {1, "update_1", "readded_1"},
+        {2, "update_2", "readded_2"},
+        {3, "insert_3", "readded_3"}}));
+  };
+
+  RunTestWithColocatedParam(schedule_id);
+}
+
 TEST_P(YbAdminSnapshotScheduleTestWithYsqlColocationParam, FailAfterMigration) {
   auto schedule_id = ASSERT_RESULT(PreparePgWithColocatedParam());
   auto conn = ASSERT_RESULT(PgConnect(client::kTableName.namespace_name()));

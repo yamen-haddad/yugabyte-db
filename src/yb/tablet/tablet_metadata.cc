@@ -470,9 +470,14 @@ Result<docdb::CompactionSchemaInfo> TableInfo::Packing(
     }
     return s;
   }
+  // PITR to a time before a DROP COLUMN brings the column back but keeps its id in deleted_cols.
+  // The restore also rolls back the table's next column id, so a later ADD COLUMN can get the id
+  // of a column dropped after the restore time. A column in the current schema is not deleted.
+  const auto& current_schema = self->doc_read_context->schema();
   docdb::ColumnIds deleted_before_history_cutoff;
   for (const auto& deleted_col : self->deleted_cols) {
-    if (deleted_col.ht < history_cutoff) {
+    if (deleted_col.ht < history_cutoff &&
+        current_schema.find_column_by_id(deleted_col.id) == Schema::kColumnNotFound) {
       deleted_before_history_cutoff.insert(deleted_col.id);
     }
   }
