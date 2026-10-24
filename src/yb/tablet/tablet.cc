@@ -857,7 +857,8 @@ Tablet::Tablet(const TabletInitData& data)
       transaction_participant_->SetWaitQueue(std::make_unique<docdb::WaitQueue>(
           transaction_participant_.get(), metadata_->fs_manager()->uuid(),
           data.waiting_txn_registry, client_future_, clock(),
-          DCHECK_NOTNULL(tablet_metrics_entity_), std::move(wq_token), data.messenger));
+          DCHECK_NOTNULL(tablet_metrics_entity_), std::move(wq_token), data.messenger,
+          &abort_pending_op_source_));
     }
   }
 
@@ -1958,6 +1959,17 @@ TabletScopedRWOperationPauses Tablet::StartShutdownStorages(
       ? std::make_optional(abort_pending_op_source_.Abort(
             STATUS_FORMAT(ShutdownInProgress, "$0aborted pending operations", LogPrefix())))
       : std::nullopt;
+
+  // Writes parked in the wait queue hold pending operations too, and the in-memory locks they
+  // wait for can belong to writes queued for replication behind this very operation: restore and
+  // truncate run on the Raft apply path, under the replica state lock, so those writes cannot
+  // proceed until this drain completes. Resume the waiters with the abort status instead
+  // (GH #35642).
+  if (abort_scope && transaction_participant_) {
+    if (auto* wait_queue = transaction_participant_->wait_queue()) {
+      wait_queue->AbortWaiters();
+    }
+  }
 
   op_pauses.not_blocking_rocksdb_shutdown_start = pause(BlockingRocksDbShutdownStart::kFalse);
 

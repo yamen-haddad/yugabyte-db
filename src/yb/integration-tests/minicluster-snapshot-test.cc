@@ -30,6 +30,7 @@
 // under the License.
 //
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <memory>
@@ -80,6 +81,7 @@
 #include "yb/tserver/ts_tablet_manager.h"
 
 #include "yb/util/backoff_waiter.h"
+#include "yb/util/scope_exit.h"
 #include "yb/util/status_format.h"
 
 #include "yb/util/sync_point.h"
@@ -93,6 +95,7 @@ DECLARE_int32(cleanup_split_tablets_interval_sec);
 DECLARE_int32(data_size_metric_updater_interval_sec);
 DECLARE_int32(timestamp_history_retention_interval_sec);
 DECLARE_bool(enable_load_balancing);
+DECLARE_bool(enable_wait_queues);
 DECLARE_bool(enforce_tablet_replica_limits);
 DECLARE_int32(ht_lease_duration_ms);
 DECLARE_double(leader_failure_max_missed_heartbeat_periods);
@@ -2258,6 +2261,77 @@ TEST_F(SysCatalogRestoreWithWritePipeliningTest, YB_DEBUG_ONLY_TEST(DdlTransacti
   auto table2_exists =
       ASSERT_RESULT(source_conn_->FetchRow<bool>("SELECT to_regclass('table2') IS NOT NULL"));
   ASSERT_FALSE(table2_exists) << "table2 from the aborted transaction unexpectedly persisted";
+}
+
+// GH #35642. A restore drains the tablet's pending operations on the Raft apply path, under the
+// replica state lock. A write parked in the wait queue holds one of those operations, and the write
+// holding the in-memory locks it needs can be queued for replication behind the restore, so the
+// drain never finished: the wait queue has to give such waiters up.
+class PgRestoreWaitQueueTest : public PgCloneInitiallyEmptyDBTest {
+ protected:
+  void SetUp() override {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_wait_queues) = true;
+    PgCloneInitiallyEmptyDBTest::SetUp();
+  }
+
+  master::YsqlColocationConfig ColocateDatabase() override {
+    return master::YsqlColocationConfig::kDBColocated;
+  }
+
+  Status WaitForWaiters(int64_t expected) {
+    return WaitFor([this, expected]() -> Result<bool> {
+      return VERIFY_RESULT(source_conn_->FetchRow<int64_t>(
+          "SELECT count(DISTINCT ybdetails->>'transactionid') FROM pg_locks WHERE NOT granted"))
+          == expected;
+    }, kTimeout, Format("$0 waiters in the wait queue", expected));
+  }
+};
+
+TEST_F(PgRestoreWaitQueueTest, RestoreGivesUpWaitQueueWaiters) {
+  ASSERT_OK(source_conn_->Execute("CREATE TABLE t (k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(source_conn_->Execute("INSERT INTO t VALUES (1, 0)"));
+  const auto restore_time = ASSERT_RESULT(GetCurrentTime());
+
+  auto holder = ASSERT_RESULT(ConnectToDB(kSourceNamespaceName));
+  ASSERT_OK(holder.Execute("BEGIN"));
+  ASSERT_OK(holder.Execute("UPDATE t SET v = 1 WHERE k = 1"));
+
+  // Two writers park behind the holder, in this order. When the restore aborts the holder, the
+  // first is resumed, takes the row's in-memory locks and is queued for replication behind the
+  // restore; the second cannot re-take those locks and keeps retrying while holding its pending
+  // operation.
+  TestThreadHolder threads;
+  std::array<Status, 2> results;
+  for (size_t i = 0; i != results.size(); ++i) {
+    threads.AddThreadFunctor([this, i, &results] {
+      auto conn = ASSERT_RESULT(ConnectToDB(kSourceNamespaceName));
+      ASSERT_OK(conn.Execute("BEGIN"));
+      results[i] = conn.ExecuteFormat("UPDATE t SET v = $0 WHERE k = 1", i + 2);
+      WARN_NOT_OK(conn.Execute("COMMIT"), "Commit failed");
+    });
+    ASSERT_OK(WaitForWaiters(static_cast<int64_t>(i + 1)));
+  }
+
+  // Park the restore apply, with the replica state lock held and the holder already aborted,
+  // until the second writer is retrying its locks.
+  auto* sync_point = SyncPoint::GetInstance();
+  sync_point->LoadDependency(
+      {{"ContentiousWaiterTask::Run:Start", "TabletSnapshots::Restore:AbortedActiveTransactions"}});
+  sync_point->EnableProcessing();
+  auto sync_point_cleanup = ScopeExit([sync_point] {
+    sync_point->DisableProcessing();
+    sync_point->LoadDependency({});
+  });
+
+  const auto restoration_id = ASSERT_RESULT(RestoreSnapshotSchedule(
+      master_backup_proxy_.get(), schedule_id_,
+      HybridTime::FromMicros(static_cast<uint64>(restore_time.ToInt64())), kTimeout));
+  ASSERT_OK(WaitForRestoration(master_backup_proxy_.get(), restoration_id, 60s * kTimeMultiplier));
+
+  threads.JoinAll();
+  // The second writer gets the abort status; what its client reports depends on its retries (the
+  // tablet stays paused until the restore ends), so only the restore finishing is asserted.
+  LOG(INFO) << "Writers: " << results[0] << ", " << results[1];
 }
 
 }  // namespace master

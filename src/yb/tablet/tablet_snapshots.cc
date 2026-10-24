@@ -52,6 +52,7 @@
 #include "yb/util/status_format.h"
 #include "yb/util/status_log.h"
 #include "yb/util/stol_utils.h"
+#include "yb/util/sync_point.h"
 
 using std::string;
 
@@ -560,6 +561,9 @@ Status TabletSnapshots::Restore(SnapshotOperation* operation) {
   WARN_NOT_OK(
       tablet().AbortActiveTransactions(deadline),
       Format("Cannot abort transactions for tablet $0 during restore", tablet().tablet_id()));
+  // The replica state lock is held here (restore applies on the Raft apply path), so a test can
+  // park the restore with the aborts already signalled and the storages not yet drained.
+  TEST_SYNC_POINT("TabletSnapshots::Restore:AbortedActiveTransactions");
 
   if (!snapshot_dir.empty()) {
     RETURN_NOT_OK_PREPEND(

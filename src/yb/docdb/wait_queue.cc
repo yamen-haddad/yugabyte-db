@@ -50,6 +50,7 @@
 #include "yb/tablet/transaction_participant.h"
 #include "yb/tserver/tserver_service.pb.h"
 
+#include "yb/util/abort_source.h"
 #include "yb/util/atomic.h"
 #include "yb/util/locks.h"
 #include "yb/util/logging.h"
@@ -935,8 +936,8 @@ struct SerialWaiter {
 class ContentiousWaiterTask : public std::enable_shared_from_this<ContentiousWaiterTask>,
                               public rpc::ThreadPoolTask {
  public:
-  explicit ContentiousWaiterTask(SerialWaiter serial_waiter)
-      : serial_waiter_(std::move(serial_waiter)) {
+  ContentiousWaiterTask(SerialWaiter serial_waiter, const AbortSource* abort_source)
+      : serial_waiter_(std::move(serial_waiter)), abort_source_(abort_source) {
     serial_waiter_.waiter->IncrementContentiousWaiters();
   }
 
@@ -954,16 +955,34 @@ class ContentiousWaiterTask : public std::enable_shared_from_this<ContentiousWai
 
     auto& waiter = serial_waiter_.waiter;
     VLOG(1) << "Resuming waiter " << waiter->LogPrefix() << "on rpc threadpool.";
+    TEST_SYNC_POINT("ContentiousWaiterTask::Run:Start");
 
     auto start_time = MonoTime::Now();
     auto deadline = waiter->deadline();
-    auto s = waiter->InvokeCallback(Status::OK(), serial_waiter_.resolve_ht, deadline);
-    if (s.ok()) {
-      VLOG(4) << "Waiter " << waiter->LogPrefix() << "resumed with status ok.";
-      return;
+    Status s;
+    for (;;) {
+      // Lock in bounded slices and poll the abort source in between: the lock holder can be a
+      // write queued for replication behind a restore or truncate apply that is itself waiting
+      // for this waiter's pending operation (GH #35642).
+      s = waiter->InvokeCallback(
+          Status::OK(), serial_waiter_.resolve_ht,
+          std::min(deadline, GetWaitForRelockUnblockedKeysDeadline()));
+      if (s.ok()) {
+        VLOG(4) << "Waiter " << waiter->LogPrefix() << "resumed with status ok.";
+        return;
+      }
+      if (abort_source_) {
+        auto abort_status = abort_source_->AbortStatus();
+        if (!abort_status.ok()) {
+          s = std::move(abort_status);
+          break;
+        }
+      }
+      if (CoarseMonoClock::Now() >= deadline) {
+        s = s.CloneAndAppend(Format("timeout: $0", deadline - ToCoarse(start_time)));
+        break;
+      }
     }
-
-    s = s.CloneAndAppend(Format("timeout: $0", deadline - ToCoarse(start_time)));
     DCHECK_OK(waiter->InvokeCallback(s));
     VLOG(1) << "Waiter " << waiter->LogPrefix() << " resumed with status: " << s;
   }
@@ -980,6 +999,7 @@ class ContentiousWaiterTask : public std::enable_shared_from_this<ContentiousWai
   }
 
   SerialWaiter serial_waiter_;
+  const AbortSource* const abort_source_;
   std::shared_ptr<ContentiousWaiterTask> retained_self_;
 };
 
@@ -988,9 +1008,10 @@ class ContentiousWaiterTask : public std::enable_shared_from_this<ContentiousWai
 class ResumedWaiterRunner {
  public:
   ResumedWaiterRunner(
-      ThreadPoolToken* thread_pool_token, const std::string& log_prefix, rpc::Messenger* messenger)
+      ThreadPoolToken* thread_pool_token, const std::string& log_prefix, rpc::Messenger* messenger,
+      const AbortSource* abort_source)
           : thread_pool_token_(DCHECK_NOTNULL(thread_pool_token)), log_prefix_(log_prefix),
-            messenger_(messenger) {}
+            messenger_(messenger), abort_source_(abort_source) {}
 
   void Submit(
       const WaiterDataPtr& waiter, const Status& status,
@@ -1048,6 +1069,26 @@ class ResumedWaiterRunner {
         << "contentious_waiters_ found in non-empty state. Could block tablet shutdown.";
   }
 
+  // Resumes the waiters queued for resumption with the given abort status. Waiters already
+  // retrying their locks on the rpc thread pool poll the abort source themselves.
+  void AbortWaiters(const Status& status) EXCLUDES(mutex_) {
+    std::vector<WaiterDataPtr> waiters;
+    {
+      UniqueLock l(mutex_);
+      if (shutting_down_) {
+        return;
+      }
+      waiters.reserve(pq_.size());
+      while (!pq_.empty()) {
+        waiters.push_back(pq_.top().waiter);
+        pq_.pop();
+      }
+    }
+    for (const auto& waiter : waiters) {
+      waiter->InvokeCallbackOrWarn(status);
+    }
+  }
+
   void CleanContentiousWeakWaiterDatas() EXCLUDES(mutex_) {
     UniqueLock l(mutex_);
     EraseIf([](const auto& weak_waiter) {
@@ -1074,7 +1115,9 @@ class ResumedWaiterRunner {
                               << " with request_id: " << waiter->request_id
                               << " and start time (us): " << waiter->txn_start_us;
         }
-        auto s = waiter->InvokeCallback(Status::OK(), resolve_ht);
+        auto abort_status = abort_source_ ? abort_source_->AbortStatus() : Status::OK();
+        auto s = abort_status.ok() ? waiter->InvokeCallback(Status::OK(), resolve_ht)
+                                   : waiter->InvokeCallback(abort_status);
         if (!s.ok()) {
           VLOG_WITH_PREFIX(1) << "Waiter's InvokeCallback failed: " << s;
           unresumed_waiters.push_back(SerialWaiter {
@@ -1107,7 +1150,8 @@ class ResumedWaiterRunner {
         } else {
           VLOG_WITH_PREFIX(1) << "Scheduling waiter " << serial_waiter.waiter->LogPrefix()
                               << "resumption on the rpc threadpool.";
-          auto resume_contentious_waiter = std::make_shared<ContentiousWaiterTask>(serial_waiter);
+          auto resume_contentious_waiter =
+              std::make_shared<ContentiousWaiterTask>(serial_waiter, abort_source_);
           resume_contentious_waiter->Schedule(messenger_);
         }
       }
@@ -1145,6 +1189,7 @@ class ResumedWaiterRunner {
   bool shutting_down_ GUARDED_BY(mutex_) = false;
   const std::string log_prefix_;
   rpc::Messenger* messenger_;
+  const AbortSource* const abort_source_;
 };
 
 } // namespace
@@ -1156,11 +1201,12 @@ class WaitQueue::Impl {
        const std::shared_future<client::YBClient*>& client_future,
        const server::ClockPtr& clock, const MetricEntityPtr& metrics,
        std::unique_ptr<ThreadPoolToken> thread_pool_token,
-       rpc::Messenger* messenger)
+       rpc::Messenger* messenger, const AbortSource* abort_source)
       : txn_status_manager_(txn_status_manager), permanent_uuid_(permanent_uuid),
         waiting_txn_registry_(waiting_txn_registry), client_future_(client_future), clock_(clock),
+        abort_source_(abort_source),
         thread_pool_token_(std::move(thread_pool_token)),
-        waiter_runner_(thread_pool_token_.get(), LogPrefix(), messenger),
+        waiter_runner_(thread_pool_token_.get(), LogPrefix(), messenger, abort_source),
         pending_time_waiting_(METRIC_wait_queue_pending_time_waiting.Instantiate(metrics)),
         finished_waiting_latency_(METRIC_wait_queue_finished_waiting_latency.Instantiate(metrics)),
         blockers_per_waiter_(METRIC_wait_queue_blockers_per_waiter.Instantiate(metrics)),
@@ -1273,6 +1319,7 @@ class WaitQueue::Impl {
         VLOG_WITH_PREFIX_AND_FUNC(1) << "Found " << blockers_map.size()
                                      << " blockers for " << waiter_txn_id;
 
+        RETURN_NOT_OK(AbortStatus());
         std::vector<BlockerDataAndConflictInfo> blocker_datas;
         auto blockers = std::make_shared<ConflictDataManager>(blockers_map.size());
         blocker_datas.reserve(blockers_map.size());
@@ -1325,6 +1372,7 @@ class WaitQueue::Impl {
       if (shutting_down_) {
         return kShuttingDownError;
       }
+      RETURN_NOT_OK(AbortStatus());
 
       for (auto& blocker : blockers->RemainingTransactions()) {
         auto blocker_data = std::make_shared<BlockerData>(blocker.id, blocker.status_tablet);
@@ -1684,6 +1732,40 @@ class WaitQueue::Impl {
     auto now = clock_->Now();
     for (const auto& waiter : resolved_blocker->ForceSignal(now)) {
       InvokeWaiterCallback(Status::OK(), waiter, now);
+    }
+  }
+
+  // The status to fail waiters with while the tablet drains its pending operations, OK otherwise.
+  Status AbortStatus() const {
+    return abort_source_ ? abort_source_->AbortStatus() : Status::OK();
+  }
+
+  // See WaitQueue::AbortWaiters.
+  void AbortWaiters() EXCLUDES(mutex_) {
+    auto status = AbortStatus();
+    if (status.ok()) {
+      LOG_WITH_PREFIX(DFATAL) << "AbortWaiters called without an active abort";
+      return;
+    }
+    decltype(waiter_status_) waiter_status_copy;
+    decltype(single_shard_waiters_) single_shard_waiters_copy;
+    {
+      UniqueLock l(mutex_);
+      if (shutting_down_) {
+        return;
+      }
+      waiter_status_copy.swap(waiter_status_);
+      single_shard_waiters_copy.swap(single_shard_waiters_);
+      // Blockers stay: their entries expire with the waiters that referenced them.
+    }
+    waiter_runner_.AbortWaiters(status);
+    for (const auto& [_, waiting_txn] : waiter_status_copy) {
+      for (const auto& waiter : waiting_txn->PurgeWaiters()) {
+        waiter->InvokeCallbackOrWarn(status);
+      }
+    }
+    for (const auto& waiter : single_shard_waiters_copy) {
+      waiter->InvokeCallbackOrWarn(status);
     }
   }
 
@@ -2198,6 +2280,7 @@ class WaitQueue::Impl {
   WaitingTxnRegistry* const waiting_txn_registry_;
   std::shared_future<client::YBClient*> client_future_;
   server::ClockPtr clock_;
+  const AbortSource* const abort_source_;
   std::unique_ptr<ThreadPoolToken> thread_pool_token_;
   ResumedWaiterRunner waiter_runner_;
   scoped_refptr<EventStats> pending_time_waiting_;
@@ -2218,9 +2301,10 @@ WaitQueue::WaitQueue(
     const server::ClockPtr& clock,
     const MetricEntityPtr& metrics,
     std::unique_ptr<ThreadPoolToken> thread_pool_token,
-    rpc::Messenger* messenger)
+    rpc::Messenger* messenger,
+    const AbortSource* abort_source)
     : impl_(new Impl(txn_status_manager, permanent_uuid, waiting_txn_registry, client_future, clock,
-                     metrics, std::move(thread_pool_token), messenger)) {
+                     metrics, std::move(thread_pool_token), messenger, abort_source)) {
 }
 
 WaitQueue::~WaitQueue() = default;
@@ -2250,6 +2334,10 @@ Result<bool> WaitQueue::MaybeWaitOnLocks(
 }
 
 void WaitQueue::Poll(HybridTime now) { return impl_->Poll(now); }
+
+void WaitQueue::AbortWaiters() {
+  impl_->AbortWaiters();
+}
 
 void WaitQueue::StartShutdown() {
   impl_->StartShutdown();

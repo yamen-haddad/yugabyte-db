@@ -30,6 +30,10 @@
 #include "yb/util/threadpool.h"
 
 namespace yb {
+class AbortSource;
+}
+
+namespace yb {
 namespace docdb {
 
 class ScopedWaitingTxnRegistration {
@@ -68,7 +72,8 @@ class WaitQueue {
       const server::ClockPtr& clock,
       const MetricEntityPtr& metrics,
       std::unique_ptr<ThreadPoolToken> thread_pool_token,
-      rpc::Messenger* messenger);
+      rpc::Messenger* messenger,
+      const AbortSource* abort_source);
 
   ~WaitQueue();
 
@@ -103,6 +108,14 @@ class WaitQueue {
       IntentProviderFunc intent_provider, WaitDoneCallback callback);
 
   void Poll(HybridTime now);
+
+  // Resumes every waiter with the status of the abort source given at construction, which must be
+  // active; new waits are refused with that status while it stays active. Tablet::
+  // StartShutdownStorages calls this when a restore or truncate drains the tablet's pending
+  // operations: each waiter holds one of them, and the in-memory locks it waits for can belong to
+  // a write queued for replication behind that very operation, so the drain would never finish on
+  // its own (GH #35642).
+  void AbortWaiters();
 
   void StartShutdown();
 
